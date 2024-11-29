@@ -24,7 +24,7 @@ func newBlob(blobDir string, cacheDir string) *blob {
 	}
 }
 
-func (b *blob) create(input io.Reader) (string, error) {
+func (b *blob) create(input io.Reader) (token string, err error) {
 	temp, err := os.CreateTemp(b.cache, "cache.*")
 	if err != nil {
 		return "", err
@@ -36,7 +36,7 @@ func (b *blob) create(input io.Reader) (string, error) {
 		_ = os.Remove(temp.Name())
 		return "", err
 	}
-	token := fmt.Sprintf("%x", sha256Hash.Sum(nil))
+	token = fmt.Sprintf("%x", sha256Hash.Sum(nil))
 	open := b.locker.Open(token)
 	lock := open.Lock(false)
 	defer lock.Close()
@@ -45,7 +45,7 @@ func (b *blob) create(input io.Reader) (string, error) {
 		_ = os.Remove(temp.Name())
 		return "", err
 	}
-	dest := filepath.Join(b.blob, token)
+	dest := filepath.Join(destDir, token)
 	stat, err := os.Stat(dest)
 	if err != nil && !os.IsNotExist(err) {
 		_ = os.Remove(temp.Name())
@@ -58,7 +58,18 @@ func (b *blob) create(input io.Reader) (string, error) {
 	return token, os.Rename(temp.Name(), dest)
 }
 
+func (b *blob) open(token string) (io.ReadSeekCloser, error) {
+	if len(token) < 5 {
+		return nil, errors.New("token too short")
+	}
+	dest := filepath.Join(b.blob, token[:2], token[2:4], token)
+	return os.OpenFile(dest, os.O_RDONLY, 0666)
+}
+
 func (b *blob) delete(token string) error {
+	if len(token) < 5 {
+		return errors.New("token too short")
+	}
 	open := b.locker.Open(token)
 	lock := open.Lock(false)
 	defer lock.Close()

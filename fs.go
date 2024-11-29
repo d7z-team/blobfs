@@ -6,12 +6,11 @@ import (
 )
 
 type FSBlob struct {
-	baseDir  string
-	cacheDir string
-	metaDir  string
-	blobDir  string
+	baseDir string
+	metaDir string
 
-	blob *blob
+	blob       *blob
+	metaLocker *RWLockGroup
 }
 
 func BlobFS(basedir string) (*FSBlob, error) {
@@ -20,20 +19,22 @@ func BlobFS(basedir string) (*FSBlob, error) {
 		return nil, err
 	}
 	result := &FSBlob{
-		baseDir:  basedir,
-		cacheDir: filepath.Join(basedir, "cache"),
-		metaDir:  filepath.Join(basedir, "meta"),
-		blobDir:  filepath.Join(basedir, "blob"),
+		baseDir:    basedir,
+		metaDir:    filepath.Join(basedir, "meta"),
+		blob:       newBlob(filepath.Join(basedir, "blob"), filepath.Join(basedir, "cache")),
+		metaLocker: NewRWLockGroup(),
 	}
 	if err := os.MkdirAll(result.baseDir, 0755); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
-	if err := os.MkdirAll(result.cacheDir, 0755); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(result.blob.blob, 0755); err != nil && !os.IsExist(err) {
+		return nil, err
+	}
+	if err := os.MkdirAll(result.blob.cache, 0755); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 	if err := os.MkdirAll(result.metaDir, 0755); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
-	result.blob = newBlob(result.blobDir, result.cacheDir)
 	return result, nil
 }
