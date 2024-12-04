@@ -89,17 +89,38 @@ func (b *blob) create(input io.Reader) (token string, err error) {
 	return token, nil
 }
 
-func (b *blob) open(token string) (io.ReadSeekCloser, error) {
+type BlobStat struct {
+	io.ReadSeekCloser
+	closer func()
+}
+
+func (b *BlobStat) Close() error {
+	err := b.ReadSeekCloser.Close()
+	b.closer()
+	return err
+}
+
+func (b *blob) open(token string) (*BlobStat, error) {
 	b.gcLocker.RLock()
-	defer b.gcLocker.RUnlock()
 	if len(token) < 5 {
 		return nil, errors.New("token too short")
 	}
 	if !b.linker.Exists(token) {
+		b.gcLocker.RUnlock()
 		return nil, errors.Join(os.ErrNotExist, errors.New("token not exists"))
 	}
 	dest := filepath.Join(b.blob, token[:2], token[2:4], token)
-	return os.OpenFile(dest, os.O_RDONLY, 0o666)
+	file, err := os.OpenFile(dest, os.O_RDONLY, 0o666)
+	if err != nil {
+		b.gcLocker.RUnlock()
+		return nil, err
+	}
+	return &BlobStat{
+		ReadSeekCloser: file,
+		closer: func() {
+			b.gcLocker.RUnlock()
+		},
+	}, nil
 }
 
 func (b *blob) delete(token string) error {

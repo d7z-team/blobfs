@@ -41,8 +41,9 @@ func TestFSBlobGc(t *testing.T) {
 	assert.NoError(t, bl.blobGC())
 	_, err = bl.open(token2)
 	assert.Error(t, err)
-	_, err = bl.open(token1)
+	data, err := bl.open(token1)
 	assert.NoError(t, err)
+	assert.NoError(t, data.Close())
 	assert.NoError(t, bl.Unlink(token1))
 	assert.NoError(t, bl.blobGC())
 }
