@@ -33,6 +33,18 @@ func pathClean(path string) string {
 	return strings.Join(fsPath, "/")
 }
 
+func (b *FSBlob) Refresh(path string) error {
+	path = pathClean(path)
+	lock := b.metaLocker.Open(path).Lock(false)
+	defer lock.Close()
+	if lastMeta, err := b.metaLoad(path); err == nil {
+		lastMeta.CreateAt = time.Now()
+		return b.metaSave(path, lastMeta)
+	} else {
+		return err
+	}
+}
+
 // Push 将文件推入到块中
 func (b *FSBlob) Push(path string, input io.Reader, options map[string]string) error {
 	path = pathClean(path)
