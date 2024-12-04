@@ -2,10 +2,11 @@ package blobfs
 
 import (
 	"bytes"
-	"github.com/stretchr/testify/assert"
 	"io"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestMetaPullPush(t *testing.T) {
@@ -27,6 +28,6 @@ func TestMetaClear(t *testing.T) {
 	all, err := io.ReadAll(fs.PullOrNil("base/route"))
 	assert.NoError(t, err)
 	assert.Equal(t, "hello world", string(all))
-	assert.NoError(t, fs.Remove("base/", -10*time.Millisecond))
+	assert.NoError(t, fs.Remove("base/", nil, -10*time.Millisecond))
 	assert.Empty(t, fs.PullOrNil("base/route"))
 }

@@ -23,6 +23,7 @@ func (p *linker) Init(blob string) {
 	defer p.locker.RUnlock()
 	_, _ = p.store.LoadOrStore(blob, uint(0))
 }
+
 func (p *linker) Link(blob string) error {
 	p.locker.RLock()
 	defer p.locker.RUnlock()
@@ -55,6 +56,7 @@ func (p *linker) Unlink(blob string) error {
 	}
 	return nil
 }
+
 func (p *linker) Delete(token string) {
 	p.locker.RLock()
 	defer p.locker.RUnlock()

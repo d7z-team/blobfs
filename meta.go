@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -90,9 +91,9 @@ func (b *FSBlob) Pull(path string) (*PullContent, error) {
 	}, nil
 }
 
-func (b *FSBlob) Remove(pattern string, ttl time.Duration) error {
+func (b *FSBlob) Remove(base string, regex *regexp.Regexp, ttl time.Duration) error {
 	date := time.Now().Add(-ttl)
-	return filepath.Walk(filepath.Join(b.metaDir, pathClean(pattern)), func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(filepath.Join(b.metaDir, pathClean(base)), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -100,13 +101,16 @@ func (b *FSBlob) Remove(pattern string, ttl time.Duration) error {
 			return nil
 		}
 		fixedPath := strings.TrimSuffix(strings.TrimPrefix(path, b.metaDir+string(filepath.Separator)), "/.meta")
+		if regex != nil && !regex.MatchString(fixedPath) {
+			// ignore regex
+			return nil
+		}
 		lock := b.metaLocker.Open(fixedPath).Lock(true)
 		defer lock.Close()
 		meta, err := b.metaLoad(fixedPath)
 		if err != nil {
 			return err
 		}
-
 		if meta.CreateAt.Before(date) {
 			if err = b.blob.Unlink(meta.Blob); err != nil {
 				return err
@@ -131,15 +135,16 @@ func (b *FSBlob) metaLoad(path string) (*metaOptions, error) {
 	}
 	return meta, nil
 }
+
 func (b *FSBlob) metaSave(path string, options *metaOptions) error {
 	meta, err := json.Marshal(options)
 	if err != nil {
 		return err
 	}
-	if err = os.MkdirAll(filepath.Join(b.metaDir, path), 0755); err != nil && !os.IsNotExist(err) {
+	if err = os.MkdirAll(filepath.Join(b.metaDir, path), 0o755); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err = os.WriteFile(filepath.Join(b.metaDir, path, ".meta"), meta, 0600); err != nil {
+	if err = os.WriteFile(filepath.Join(b.metaDir, path, ".meta"), meta, 0o600); err != nil {
 		return err
 	}
 	return nil

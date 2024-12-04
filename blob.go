@@ -30,10 +30,10 @@ func newBlob(blobDir string, cacheDir string) (*blob, error) {
 		gcLocker: sync.RWMutex{},
 	}
 
-	if err := os.MkdirAll(b.blob, 0755); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(b.blob, 0o755); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
-	if err := os.MkdirAll(b.cache, 0755); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(b.cache, 0o755); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 	return b, filepath.Walk(blobDir, func(path string, info os.FileInfo, err error) error {
@@ -66,7 +66,7 @@ func (b *blob) create(input io.Reader) (token string, err error) {
 	lock := open.Lock(false)
 	defer lock.Close()
 	destDir := filepath.Join(b.blob, token[:2], token[2:4])
-	if err := os.MkdirAll(destDir, 0755); err != nil && os.IsExist(err) {
+	if err := os.MkdirAll(destDir, 0o755); err != nil && os.IsExist(err) {
 		_ = os.Remove(temp.Name())
 		return "", err
 	}
@@ -99,7 +99,7 @@ func (b *blob) open(token string) (io.ReadSeekCloser, error) {
 		return nil, errors.Join(os.ErrNotExist, errors.New("token not exists"))
 	}
 	dest := filepath.Join(b.blob, token[:2], token[2:4], token)
-	return os.OpenFile(dest, os.O_RDONLY, 0666)
+	return os.OpenFile(dest, os.O_RDONLY, 0o666)
 }
 
 func (b *blob) delete(token string) error {

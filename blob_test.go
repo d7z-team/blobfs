@@ -2,9 +2,10 @@ package blobfs
 
 import (
 	"bytes"
-	"github.com/stretchr/testify/assert"
 	"io"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestBlobPullPush(t *testing.T) {
@@ -44,5 +45,4 @@ func TestFSBlobGc(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NoError(t, bl.Unlink(token1))
 	assert.NoError(t, bl.blobGC())
-
 }

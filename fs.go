@@ -34,10 +34,10 @@ func BlobFS(basedir string) (*FSBlob, error) {
 		blob:       b,
 		metaLocker: newRWLockGroup(),
 	}
-	if err := os.MkdirAll(result.baseDir, 0755); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(result.baseDir, 0o755); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
-	if err := os.MkdirAll(result.metaDir, 0755); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(result.metaDir, 0o755); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 
