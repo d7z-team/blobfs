@@ -15,6 +15,13 @@ type metaOptions struct {
 	Options  map[string]string `json:"extras"`
 }
 
+type PullContent struct {
+	io.ReadSeekCloser
+	CreateAt time.Time
+	ETag     string
+	Options  map[string]string
+}
+
 func pathClean(path string) string {
 	fsPath := strings.Split(strings.Trim(filepath.ToSlash(filepath.Clean(path)), "/"), "/")
 	for i, item := range fsPath {
@@ -27,6 +34,7 @@ func pathClean(path string) string {
 
 // Push 将文件推入到块中
 func (b *FSBlob) Push(path string, input io.Reader, options map[string]string) error {
+	path = pathClean(path)
 	if options == nil {
 		options = make(map[string]string)
 	}
@@ -36,32 +44,84 @@ func (b *FSBlob) Push(path string, input io.Reader, options map[string]string) e
 	if err != nil {
 		return err
 	}
-	meta, err := json.Marshal(metaOptions{
+	if lastMeta, err := b.metaLoad(path); err == nil {
+		if err = b.blob.Unlink(lastMeta.Blob); err != nil {
+			return err
+		}
+	}
+	if err = b.blob.Link(token); err != nil {
+		return err
+	}
+	return b.metaSave(path, &metaOptions{
 		Blob:     token,
 		CreateAt: time.Now(),
 		Options:  options,
 	})
+}
+
+func (b *FSBlob) PullOrNil(path string) *PullContent {
+	pull, err := b.Pull(path)
 	if err != nil {
-		return err
+		return nil
 	}
-	path = filepath.Join(b.metaDir, pathClean(path))
-	if err = os.MkdirAll(path, 0755); err != nil && !os.IsExist(err) {
-		return err
-	}
-	metaPath := filepath.Join(path, ".meta")
-	if err = os.WriteFile(metaPath, meta, 0600); err != nil {
-		return err
-	}
-	return nil
+	return pull
 }
 
 // Pull Push 从块中拉取文件
-func (b *FSBlob) Pull(path string) (io.ReadSeekCloser, error) {
+func (b *FSBlob) Pull(path string) (*PullContent, error) {
+	path = pathClean(path)
 	lock := b.metaLocker.Open(path).Lock(true)
 	defer lock.Close()
-	path = filepath.Join(b.metaDir, pathClean(path))
-	metaPath := filepath.Join(path, ".meta")
-	data, err := os.ReadFile(metaPath)
+	meta, err := b.metaLoad(pathClean(path))
+	if err != nil {
+		b.metaLocker.Del(path)
+		return nil, err
+	}
+	open, err := b.blob.open(meta.Blob)
+	if err != nil {
+		b.metaLocker.Del(path)
+		return nil, err
+	}
+	return &PullContent{
+		ReadSeekCloser: open,
+		CreateAt:       meta.CreateAt,
+		ETag:           meta.Blob,
+		Options:        meta.Options,
+	}, nil
+}
+
+func (b *FSBlob) Remove(pattern string, ttl time.Duration) error {
+	date := time.Now().Add(-ttl)
+	return filepath.Walk(filepath.Join(b.metaDir, pathClean(pattern)), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || info.Name() != ".meta" {
+			return nil
+		}
+		fixedPath := strings.TrimSuffix(strings.TrimPrefix(path, b.metaDir+string(filepath.Separator)), "/.meta")
+		lock := b.metaLocker.Open(fixedPath).Lock(true)
+		defer lock.Close()
+		meta, err := b.metaLoad(fixedPath)
+		if err != nil {
+			return err
+		}
+
+		if meta.CreateAt.Before(date) {
+			if err = b.blob.Unlink(meta.Blob); err != nil {
+				return err
+			}
+			if err = os.Remove(path); err != nil {
+				return err
+			}
+			b.metaLocker.Del(fixedPath)
+		}
+		return nil
+	})
+}
+
+func (b *FSBlob) metaLoad(path string) (*metaOptions, error) {
+	data, err := os.ReadFile(filepath.Join(b.metaDir, path, ".meta"))
 	if err != nil {
 		return nil, err
 	}
@@ -69,28 +129,18 @@ func (b *FSBlob) Pull(path string) (io.ReadSeekCloser, error) {
 	if err = json.Unmarshal(data, meta); err != nil {
 		return nil, err
 	}
-	return b.blob.open(meta.Blob)
+	return meta, nil
 }
-
-func (b *FSBlob) Remove(pattern string, ttl time.Duration) error {
-	return filepath.Walk(filepath.Join(pattern, b.metaDir), func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		if info.Name() != ".meta" {
-			return nil
-		}
-		metadata, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		meta := &metaOptions{}
-		if err = json.Unmarshal(metadata, meta); err != nil {
-			return err
-		}
-		return nil
-	})
+func (b *FSBlob) metaSave(path string, options *metaOptions) error {
+	meta, err := json.Marshal(options)
+	if err != nil {
+		return err
+	}
+	if err = os.MkdirAll(filepath.Join(b.metaDir, path), 0755); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(b.metaDir, path, ".meta"), meta, 0600); err != nil {
+		return err
+	}
+	return nil
 }

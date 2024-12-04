@@ -2,50 +2,40 @@ package blobfs
 
 import "sync"
 
-type RWLockGroup struct {
+type rwLockGroup struct {
 	group sync.Map
 }
 
-func NewRWLockGroup() *RWLockGroup {
-	return &RWLockGroup{
+func newRWLockGroup() *rwLockGroup {
+	return &rwLockGroup{
 		sync.Map{},
 	}
 }
 
-func (g *RWLockGroup) Open(key string) *RWLocker {
-	actual, _ := g.group.LoadOrStore(key, &RWLocker{
+func (g *rwLockGroup) Open(key string) *rwLocker {
+	actual, _ := g.group.LoadOrStore(key, &rwLocker{
 		locker:       sync.RWMutex{},
 		switchLocker: sync.Mutex{},
 	})
-	locker := actual.(*RWLocker)
+	locker := actual.(*rwLocker)
 	return locker
 }
 
-func (g *RWLockGroup) Del(key string) {
+func (g *rwLockGroup) Del(key string) {
 	g.group.Delete(key)
 }
 
-type RWLocker struct {
+type rwLocker struct {
 	locker       sync.RWMutex
 	switchLocker sync.Mutex
 }
 
-func (rw *RWLocker) TryLock(read bool) bool {
-	rw.switchLocker.Lock()
-	defer rw.switchLocker.Unlock()
-	if read {
-		return rw.locker.TryRLock()
-	} else {
-		return rw.locker.TryLock()
-	}
-}
-
-func (rw *RWLocker) Lock(read bool) *LockerContent {
+func (rw *rwLocker) Lock(read bool) *lockerContent {
 	rw.switchLocker.Lock()
 	defer rw.switchLocker.Unlock()
 	if read {
 		rw.locker.RLock()
-		return &LockerContent{
+		return &lockerContent{
 			rw,
 			true,
 			func() {
@@ -54,7 +44,7 @@ func (rw *RWLocker) Lock(read bool) *LockerContent {
 		}
 	} else {
 		rw.locker.Lock()
-		return &LockerContent{
+		return &lockerContent{
 			rw,
 			false,
 			func() {
@@ -64,13 +54,13 @@ func (rw *RWLocker) Lock(read bool) *LockerContent {
 	}
 }
 
-type LockerContent struct {
-	locker *RWLocker
+type lockerContent struct {
+	locker *rwLocker
 	rLock  bool
 	close  func()
 }
 
-func (c *LockerContent) AsRLocker() {
+func (c *lockerContent) AsRLocker() {
 	if !c.rLock {
 		c.locker.switchLocker.Lock()
 		defer c.locker.switchLocker.Unlock()
@@ -85,7 +75,7 @@ func (c *LockerContent) AsRLocker() {
 	}
 }
 
-func (c *LockerContent) AsLocker() {
+func (c *lockerContent) AsLocker() {
 	if c.rLock {
 		c.locker.switchLocker.Lock()
 		defer c.locker.switchLocker.Unlock()
@@ -100,6 +90,6 @@ func (c *LockerContent) AsLocker() {
 	}
 }
 
-func (c *LockerContent) Close() {
+func (c *lockerContent) Close() {
 	c.close()
 }
