@@ -113,7 +113,7 @@ func (b *FSBlob) Pull(path string) (*PullContent, error) {
 
 func (b *FSBlob) Remove(base string, regex *regexp.Regexp, ttl time.Duration) error {
 	date := time.Now().Add(-ttl)
-	return filepath.Walk(filepath.Join(b.metaDir, pathClean(base)), func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(filepath.Join(b.metaDir, pathClean(base)), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -141,7 +141,10 @@ func (b *FSBlob) Remove(base string, regex *regexp.Regexp, ttl time.Duration) er
 			b.metaLocker.Del(fixedPath)
 		}
 		return nil
-	})
+	}); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (b *FSBlob) Child(name string) Objects {
