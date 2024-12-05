@@ -21,7 +21,7 @@ func newLinker() *linker {
 func (p *linker) Init(blob string) {
 	p.locker.RLock()
 	defer p.locker.RUnlock()
-	_, _ = p.store.LoadOrStore(blob, uint(0))
+	_, _ = p.store.LoadOrStore(blob, 0)
 }
 
 func (p *linker) Link(blob string) error {
@@ -32,7 +32,7 @@ func (p *linker) Link(blob string) error {
 		if !find {
 			return errors.New("blob not found")
 		}
-		if p.store.CompareAndSwap(blob, actual, actual.(uint)+1) {
+		if p.store.CompareAndSwap(blob, actual, actual.(int)+1) {
 			break
 		}
 	}
@@ -50,7 +50,7 @@ func (p *linker) Unlink(blob string) error {
 		if actual == 0 {
 			return errors.New("blob is empty")
 		}
-		if p.store.CompareAndSwap(blob, actual, actual.(uint)-1) {
+		if p.store.CompareAndSwap(blob, actual, actual.(int)-1) {
 			break
 		}
 	}
@@ -68,7 +68,7 @@ func (p *linker) Gc(item func(key string) error) error {
 	defer p.locker.Unlock()
 	data := make([]string, 0)
 	p.store.Range(func(k, v interface{}) bool {
-		if v.(uint) == 0 {
+		if v.(int) == 0 {
 			data = append(data, k.(string))
 		}
 		return true
