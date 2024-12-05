@@ -14,11 +14,6 @@ type FSBlob struct {
 	metaLocker *rwLockGroup
 }
 
-func (b *FSBlob) Close() error {
-	// 卸载所有的写入
-	return nil
-}
-
 func BlobFS(basedir string) (*FSBlob, error) {
 	basedir, err := filepath.Abs(basedir)
 	if err != nil {

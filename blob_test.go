@@ -27,8 +27,6 @@ func TestBlobPullPush(t *testing.T) {
 	assert.NoError(t, err)
 	err = bl.delete(token)
 	assert.NoError(t, err)
-	err = open.Close()
-	assert.Error(t, err)
 }
 
 func TestFSBlobGc(t *testing.T) {

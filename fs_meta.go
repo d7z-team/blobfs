@@ -16,23 +16,6 @@ type metaOptions struct {
 	Options  map[string]string `json:"extras"`
 }
 
-type PullContent struct {
-	io.ReadSeekCloser
-	CreateAt time.Time
-	ETag     string
-	Options  map[string]string
-}
-
-func pathClean(path string) string {
-	fsPath := strings.Split(strings.Trim(filepath.ToSlash(filepath.Clean(path)), "/"), "/")
-	for i, item := range fsPath {
-		if item == ".meta" || item == ".blob" {
-			fsPath[i] = "@" + item
-		}
-	}
-	return strings.Join(fsPath, "/")
-}
-
 func (b *FSBlob) Refresh(path string) error {
 	path = pathClean(path)
 	lock := b.metaLocker.Open(path).Lock(false)
@@ -43,6 +26,31 @@ func (b *FSBlob) Refresh(path string) error {
 	} else {
 		return err
 	}
+}
+
+// Transparent 透传内容
+//
+//goland:noinspection GoUnhandledErrorResult
+func (b *FSBlob) Transparent(path string, input io.ReadCloser, options map[string]string) io.ReadCloser {
+	rBlob, w1 := io.Pipe()
+	rSync, w2 := io.Pipe()
+	go func() {
+		defer w1.Close()
+		defer w2.Close()
+		defer input.Close()
+		_, err := io.Copy(io.MultiWriter(w1, w2), input)
+		if err != nil {
+			_ = w1.CloseWithError(err)
+			_ = w2.CloseWithError(err)
+		}
+	}()
+	go func() {
+		defer rBlob.Close()
+		if err := b.Push(path, rBlob, options); err != nil {
+			_ = rBlob.CloseWithError(err)
+		}
+	}()
+	return rSync
 }
 
 // Push 将文件推入到块中
@@ -134,6 +142,20 @@ func (b *FSBlob) Remove(base string, regex *regexp.Regexp, ttl time.Duration) er
 		}
 		return nil
 	})
+}
+
+func (b *FSBlob) Child(name string) Objects {
+	return newChildObjects(b, name)
+}
+
+func pathClean(path string) string {
+	fsPath := strings.Split(strings.Trim(filepath.ToSlash(filepath.Clean(path)), "/"), "/")
+	for i, item := range fsPath {
+		if item == ".meta" || item == ".blob" {
+			fsPath[i] = "@" + item
+		}
+	}
+	return strings.Join(fsPath, "/")
 }
 
 func (b *FSBlob) metaLoad(path string) (*metaOptions, error) {
