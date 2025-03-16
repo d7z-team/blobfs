@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type FSBlob struct {
@@ -57,6 +58,20 @@ func BlobFS(basedir string) (*FSBlob, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+func (b *FSBlob) mLock(path string) *rwLocker {
+	return b.metaLocker.Open(b.safePath(path))
+}
+
+func (b *FSBlob) safePath(path string) string {
+	fsPath := strings.Split(strings.Trim(filepath.ToSlash(filepath.Clean(path)), "/"), "/")
+	for i, item := range fsPath {
+		if item == ".meta" || item == ".blob" {
+			fsPath[i] = "@" + item
+		}
+	}
+	return strings.Join(fsPath, "/")
 }
 
 func (b *FSBlob) BlobGC() error {
