@@ -23,8 +23,8 @@ type Objects interface {
 	Pull(path string) (*PullContent, error)
 	// PullOrNil 取出对象
 	PullOrNil(path string) *PullContent
-	// Refresh 刷新对象过期时间
-	Refresh(path string) error
+	// Cleanup 刷新对象过期时间
+	Cleanup(path string) error
 	// Remove 按照策略移除对象
 	Remove(base string, regex *regexp.Regexp, ttl time.Duration) error
 	// Child 创建新的命名空间
@@ -58,8 +58,8 @@ func (c *ChildObjects) Pull(path string) (*PullContent, error) {
 	return c.root.Pull(c.group + "/" + path)
 }
 
-func (c *ChildObjects) Refresh(path string) error {
-	return c.root.Refresh(c.group + "/" + path)
+func (c *ChildObjects) Cleanup(path string) error {
+	return c.root.Cleanup(c.group + "/" + path)
 }
 
 func (c *ChildObjects) Remove(base string, regex *regexp.Regexp, ttl time.Duration) error {

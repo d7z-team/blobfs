@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,10 +17,10 @@ type metaOptions struct {
 	Options  map[string]string `json:"extras"`
 }
 
-func (b *FSBlob) Refresh(path string) error {
-	path = pathClean(path)
-	lock := b.metaLocker.Open(path).Lock(false)
+func (b *FSBlob) Cleanup(path string) error {
+	lock := b.mLock(path).Lock(false)
 	defer lock.Close()
+	path = b.safePath(path)
 	if lastMeta, err := b.metaLoad(path); err == nil {
 		lastMeta.CreateAt = time.Now()
 		return b.metaSave(path, lastMeta)
@@ -30,37 +31,65 @@ func (b *FSBlob) Refresh(path string) error {
 
 // Transparent 透传内容
 //
+// 请不要直接使用
+//
 //goland:noinspection GoUnhandledErrorResult
 func (b *FSBlob) Transparent(path string, input io.ReadCloser, options map[string]string) io.ReadCloser {
-	rBlob, w1 := io.Pipe()
-	rSync, w2 := io.Pipe()
-	go func() {
-		defer w1.Close()
-		defer w2.Close()
-		defer input.Close()
-		_, err := io.Copy(io.MultiWriter(w1, w2), input)
-		if err != nil {
+	lock := b.mLock(path).Lock(false)
+	wait := sync.WaitGroup{}
+	wait.Add(2)
+	p1, w1 := io.Pipe()
+	p2, w2 := io.Pipe()
+	go func(reader *io.PipeReader) {
+		defer wait.Done()
+		if err := b.pushInternal(path, reader, options); err != nil {
+			reader.CloseWithError(err)
+		}
+		reader.Close()
+	}(p2)
+	go func(i io.ReadCloser, w1 *io.PipeWriter, w2 *io.PipeWriter) {
+		defer wait.Done()
+		defer i.Close()
+		if _, err := io.Copy(io.MultiWriter(w1, w2), i); err != nil {
 			_ = w1.CloseWithError(err)
 			_ = w2.CloseWithError(err)
 		}
-	}()
-	go func() {
-		defer rBlob.Close()
-		if err := b.Push(path, rBlob, options); err != nil {
-			_ = rBlob.CloseWithError(err)
-		}
-	}()
-	return rSync
+		_ = w1.Close()
+		_ = w2.Close()
+	}(input, w1, w2)
+	return &customCloserReader{
+		Reader: p1,
+		closer: func() error {
+			err := p1.Close()
+			wait.Wait()
+			lock.close()
+			return err
+		},
+	}
+}
+
+type customCloserReader struct {
+	io.Reader
+	closed bool
+	closer func() error
+}
+
+func (c *customCloserReader) Close() error {
+	return c.closer()
 }
 
 // Push 将文件推入到块中
 func (b *FSBlob) Push(path string, input io.Reader, options map[string]string) error {
-	path = pathClean(path)
+	lock := b.mLock(path).Lock(false)
+	defer lock.Close()
+	return b.pushInternal(path, input, options)
+}
+
+func (b *FSBlob) pushInternal(path string, input io.Reader, options map[string]string) error {
+	path = b.safePath(path)
 	if options == nil {
 		options = make(map[string]string)
 	}
-	lock := b.metaLocker.Open(path).Lock(false)
-	defer lock.Close()
 	token, err := b.blob.create(input)
 	if err != nil {
 		return err
@@ -90,10 +119,10 @@ func (b *FSBlob) PullOrNil(path string) *PullContent {
 
 // Pull Push 从块中拉取文件
 func (b *FSBlob) Pull(path string) (*PullContent, error) {
-	path = pathClean(path)
-	lock := b.metaLocker.Open(path).Lock(true)
+	lock := b.mLock(path).Lock(true)
 	defer lock.Close()
-	meta, err := b.metaLoad(pathClean(path))
+	path = b.safePath(path)
+	meta, err := b.metaLoad(path)
 	if err != nil {
 		b.metaLocker.Del(path)
 		return nil, err
@@ -113,21 +142,22 @@ func (b *FSBlob) Pull(path string) (*PullContent, error) {
 
 func (b *FSBlob) Remove(base string, regex *regexp.Regexp, ttl time.Duration) error {
 	date := time.Now().Add(-ttl)
-	if err := filepath.Walk(filepath.Join(b.metaDir, pathClean(base)), func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(filepath.Join(b.metaDir, b.safePath(base)), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() || info.Name() != ".meta" {
 			return nil
 		}
-		fixedPath := strings.TrimSuffix(strings.TrimPrefix(path, b.metaDir+string(filepath.Separator)), "/.meta")
-		if regex != nil && !regex.MatchString(fixedPath) {
+		prefix := strings.TrimPrefix(path, b.metaDir+string(filepath.Separator))
+		cleanPath := strings.TrimSuffix(filepath.ToSlash(prefix), "/.meta")
+		if regex != nil && !regex.MatchString(cleanPath) {
 			// ignore regex
 			return nil
 		}
-		lock := b.metaLocker.Open(fixedPath).Lock(true)
+		lock := b.metaLocker.Open(cleanPath).Lock(true)
 		defer lock.Close()
-		meta, err := b.metaLoad(fixedPath)
+		meta, err := b.metaLoad(cleanPath)
 		if err != nil {
 			return err
 		}
@@ -138,7 +168,7 @@ func (b *FSBlob) Remove(base string, regex *regexp.Regexp, ttl time.Duration) er
 			if err = os.Remove(path); err != nil {
 				return err
 			}
-			b.metaLocker.Del(fixedPath)
+			b.metaLocker.Del(cleanPath)
 		}
 		return nil
 	}); err != nil && !os.IsNotExist(err) {
@@ -149,16 +179,6 @@ func (b *FSBlob) Remove(base string, regex *regexp.Regexp, ttl time.Duration) er
 
 func (b *FSBlob) Child(name string) Objects {
 	return newChildObjects(b, name)
-}
-
-func pathClean(path string) string {
-	fsPath := strings.Split(strings.Trim(filepath.ToSlash(filepath.Clean(path)), "/"), "/")
-	for i, item := range fsPath {
-		if item == ".meta" || item == ".blob" {
-			fsPath[i] = "@" + item
-		}
-	}
-	return strings.Join(fsPath, "/")
 }
 
 func (b *FSBlob) metaLoad(path string) (*metaOptions, error) {
