@@ -1,4 +1,4 @@
-module code.d7z.net/d7z-team/blobfs
+module gopkg.d7z.net/blobfs
 
 go 1.23.3
 
