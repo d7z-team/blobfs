@@ -66,7 +66,7 @@ func (b *blob) create(input io.Reader) (token string, err error) {
 	lock := open.Lock(false)
 	defer lock.Close()
 	destDir := filepath.Join(b.blob, token[:2], token[2:4])
-	if err := os.MkdirAll(destDir, 0o755); err != nil && os.IsExist(err) {
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		_ = os.Remove(temp.Name())
 		return "", err
 	}
@@ -91,41 +91,36 @@ func (b *blob) create(input io.Reader) (token string, err error) {
 
 type BlobStat struct {
 	io.ReadSeekCloser
-	closer func()
 }
 
 func (b *BlobStat) Close() error {
-	err := b.ReadSeekCloser.Close()
-	b.closer()
-	return err
+	return b.ReadSeekCloser.Close()
 }
 
 func (b *blob) open(token string) (*BlobStat, error) {
 	b.gcLocker.RLock()
+	defer b.gcLocker.RUnlock()
 	if len(token) < 5 {
 		return nil, errors.New("token too short")
 	}
 	if !b.linker.Exists(token) {
-		b.gcLocker.RUnlock()
 		return nil, errors.Join(os.ErrNotExist, errors.New("token not exists"))
 	}
 	dest := filepath.Join(b.blob, token[:2], token[2:4], token)
 	file, err := os.OpenFile(dest, os.O_RDONLY, 0o666)
 	if err != nil {
-		b.gcLocker.RUnlock()
 		return nil, err
 	}
 	return &BlobStat{
 		ReadSeekCloser: file,
-		closer: func() {
-			b.gcLocker.RUnlock()
-		},
 	}, nil
 }
 
 func (b *blob) delete(token string) error {
-	b.gcLocker.RLock()
-	defer b.gcLocker.RUnlock()
+	// Use Write Lock (Lock) to ensure exclusivity against create() (Reader) and blobGC() (Writer).
+	// This prevents race conditions where a file is deleted while being created or accessed.
+	b.gcLocker.Lock()
+	defer b.gcLocker.Unlock()
 	if len(token) < 5 {
 		return errors.New("token too short")
 	}
@@ -143,6 +138,10 @@ func (b *blob) delete(token string) error {
 }
 
 func (b *blob) blobGC() error {
+	// gcLocker (Write) ensures this runs exclusively.
+	// Note: Internally this acquires linkerLock -> tokenLock.
+	// While 'delete' acquires tokenLock -> linkerLock, no deadlock occurs
+	// because gcLocker serializes 'blobGC' and 'delete'.
 	b.gcLocker.Lock()
 	defer b.gcLocker.Unlock()
 	return b.linker.Gc(func(token string) error {

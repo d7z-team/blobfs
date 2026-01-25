@@ -155,7 +155,7 @@ func (b *FSBlob) Remove(base string, regex *regexp.Regexp, ttl time.Duration) er
 			// ignore regex
 			return nil
 		}
-		lock := b.metaLocker.Open(cleanPath).Lock(true)
+		lock := b.metaLocker.Open(cleanPath).Lock(false)
 		defer lock.Close()
 		meta, err := b.metaLoad(cleanPath)
 		if err != nil {

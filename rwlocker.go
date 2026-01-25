@@ -32,7 +32,7 @@ type rwLocker struct {
 
 func (rw *rwLocker) Lock(read bool) *lockerContent {
 	rw.switchLocker.Lock()
-	defer rw.switchLocker.Unlock()
+	rw.switchLocker.Unlock()
 	if read {
 		rw.locker.RLock()
 		return &lockerContent{
@@ -58,36 +58,6 @@ type lockerContent struct {
 	locker *rwLocker
 	rLock  bool
 	close  func()
-}
-
-func (c *lockerContent) AsRLocker() {
-	if !c.rLock {
-		c.locker.switchLocker.Lock()
-		defer c.locker.switchLocker.Unlock()
-		if !c.rLock {
-			c.close()
-			c.rLock = true
-			c.locker.locker.RLock()
-			c.close = func() {
-				c.locker.locker.RUnlock()
-			}
-		}
-	}
-}
-
-func (c *lockerContent) AsLocker() {
-	if c.rLock {
-		c.locker.switchLocker.Lock()
-		defer c.locker.switchLocker.Unlock()
-		if c.rLock {
-			c.close()
-			c.rLock = false
-			c.locker.locker.Lock()
-			c.close = func() {
-				c.locker.locker.Unlock()
-			}
-		}
-	}
 }
 
 func (c *lockerContent) Close() {
