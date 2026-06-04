@@ -2,7 +2,11 @@ package blobfs
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,6 +31,28 @@ func TestBlobPullPush(t *testing.T) {
 	assert.NoError(t, err)
 	err = bl.delete(token)
 	assert.NoError(t, err)
+}
+
+func TestBlobCreateRepairsCorruptExistingBlob(t *testing.T) {
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+	bl, err := newBlob(dir1, dir2)
+	assert.NoError(t, err)
+	sum := sha256.Sum256([]byte("hello world"))
+	token := fmt.Sprintf("%x", sum)
+	destDir := filepath.Join(dir1, token[:2], token[2:4])
+	assert.NoError(t, os.MkdirAll(destDir, 0o755))
+	assert.NoError(t, os.WriteFile(filepath.Join(destDir, token), []byte("corrupt"), 0o600))
+
+	created, err := bl.create(bytes.NewBufferString("hello world"))
+	assert.NoError(t, err)
+	assert.Equal(t, token, created)
+	open, err := bl.open(token)
+	assert.NoError(t, err)
+	all, err := io.ReadAll(open)
+	assert.NoError(t, err)
+	assert.NoError(t, open.Close())
+	assert.Equal(t, []byte("hello world"), all)
 }
 
 func TestFSBlobGc(t *testing.T) {

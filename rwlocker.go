@@ -14,40 +14,28 @@ func newRWLockGroup() *rwLockGroup {
 
 func (g *rwLockGroup) Open(key string) *rwLocker {
 	actual, _ := g.group.LoadOrStore(key, &rwLocker{
-		locker:       sync.RWMutex{},
-		switchLocker: sync.Mutex{},
+		locker: sync.RWMutex{},
 	})
 	locker := actual.(*rwLocker)
 	return locker
 }
 
-func (g *rwLockGroup) Del(key string) {
-	g.group.Delete(key)
-}
-
 type rwLocker struct {
-	locker       sync.RWMutex
-	switchLocker sync.Mutex
+	locker sync.RWMutex
 }
 
 func (rw *rwLocker) Lock(read bool) *lockerContent {
-	rw.switchLocker.Lock()
-	rw.switchLocker.Unlock()
 	if read {
 		rw.locker.RLock()
 		return &lockerContent{
-			rw,
-			true,
-			func() {
+			close: func() {
 				rw.locker.RUnlock()
 			},
 		}
 	} else {
 		rw.locker.Lock()
 		return &lockerContent{
-			rw,
-			false,
-			func() {
+			close: func() {
 				rw.locker.Unlock()
 			},
 		}
@@ -55,11 +43,10 @@ func (rw *rwLocker) Lock(read bool) *lockerContent {
 }
 
 type lockerContent struct {
-	locker *rwLocker
-	rLock  bool
-	close  func()
+	once  sync.Once
+	close func()
 }
 
 func (c *lockerContent) Close() {
-	c.close()
+	c.once.Do(c.close)
 }
