@@ -32,13 +32,12 @@ func (rw *rwLocker) Lock(read bool) *lockerContent {
 				rw.locker.RUnlock()
 			},
 		}
-	} else {
-		rw.locker.Lock()
-		return &lockerContent{
-			close: func() {
-				rw.locker.Unlock()
-			},
-		}
+	}
+	rw.locker.Lock()
+	return &lockerContent{
+		close: func() {
+			rw.locker.Unlock()
+		},
 	}
 }
 

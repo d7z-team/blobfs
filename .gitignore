@@ -22,6 +22,9 @@
 go.work
 go.work.sum
 
+# Local build cache used by the Makefile
+.gocache/
+
 # env file
 .env
 

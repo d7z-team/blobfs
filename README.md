@@ -1,93 +1,201 @@
 # BlobFS
 
-> A thread-safe, deduplicating object storage system for Go.
+[![Go Reference](https://pkg.go.dev/badge/gopkg.d7z.net/blobfs.svg)](https://pkg.go.dev/gopkg.d7z.net/blobfs)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
-BlobFS is a robust Go library designed for managing file storage with built-in deduplication and concurrency safety. It handles file metadata, storage, and retrieval efficiently, making it suitable for applications requiring reliable local object storage.
+BlobFS is a local content-addressed file storage library for Go. It stores files as manifests of chunks, appends chunk payloads to segment files, supports metadata-only deletes, and reclaims space with asynchronous mark/sweep GC and segment compaction.
+
+`*Store` also implements [`afero.Fs`](https://github.com/spf13/afero), so it can be used directly as a virtual filesystem. `TenantFS` exposes a standard `io/fs` view rooted at one tenant.
 
 ## Features
 
-*   **Content-Addressable Storage (CAS):** Files are stored based on their content hash (SHA-256), enabling automatic deduplication. Identical files stored at different paths consume storage space only once.
-*   **Concurrency Safe:** Built-in locking mechanisms (Read/Write locks) ensure safe concurrent access for reading, writing, and deleting operations.
-*   **Metadata Management:** Maintains metadata (creation time, custom options) for each stored object separate from the blob data.
-*   **Thread-Safe Garbage Collection:** Includes a garbage collector (`BlobGC`) to safely remove unreferenced blobs without interrupting ongoing read operations.
-*   **Atomic Operations:** Ensures critical operations like file creation and deletion are atomic to prevent data corruption.
+- SHA-256 content addressing and deduplication.
+- Single-chunk storage for files at or below `LargeFileThreshold`.
+- FastCDC-style chunking for large files.
+- Append-only segment files with fixed two-level fanout.
+- Tombstone deletes with asynchronous GC and compaction.
+- Object range reads.
+- Metadata-only updates.
+- Object and store integrity checks.
+- Explicit directory records with directory indexes.
+- Generation-checked VFS writes to avoid silent lost updates.
+- `afero.Fs` and tenant-rooted `io/fs` support.
+- Regular file modes clear executable bits by default.
 
 ## Installation
 
-```bash
+```sh
 go get gopkg.d7z.net/blobfs
 ```
 
-## Usage
+BlobFS requires Go 1.23 or newer.
 
-### Initialization
+## Quick Start
 
 ```go
 package main
 
 import (
+	"bytes"
+	"context"
+	"io"
 	"log"
+
 	"gopkg.d7z.net/blobfs"
 )
 
 func main() {
-	// Initialize BlobFS with a base directory
-	fs, err := blobfs.BlobFS("/path/to/storage")
+	ctx := context.Background()
+
+	store, err := blobfs.Open("./data/blobfs", blobfs.DefaultConfig())
 	if err != nil {
 		log.Fatal(err)
 	}
-    // ...
-}
-```
+	defer store.Close()
 
-### Storing a File (Push)
+	if err := store.MkdirAll("tenant-a/docs", 0o755); err != nil {
+		log.Fatal(err)
+	}
 
-```go
-	file, _ := os.Open("example.txt")
-	defer file.Close()
-
-	// Push the file to BlobFS at "docs/example.txt"
-	err = fs.Push("docs/example.txt", file, map[string]string{
-		"author": "dragon",
+	_, err = store.Put(ctx, "tenant-a", "docs/hello.txt", bytes.NewReader([]byte("hello blobfs")), map[string]string{
+		"content-type": "text/plain",
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-```
 
-### Retrieving a File (Pull)
-
-```go
-	// Pull the file content
-	content, err := fs.Pull("docs/example.txt")
+	reader, err := store.OpenObject(ctx, "tenant-a", "docs/hello.txt")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer content.Close()
+	defer reader.Close()
 
-	// Access metadata
-	log.Printf("Created at: %v", content.CreateAt)
-    log.Printf("Options: %v", content.Options)
-
-	// Read data
-	// io.Copy(os.Stdout, content)
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("%s", data)
+}
 ```
 
-### Garbage Collection
+## Object API
 
 ```go
-	// Clean up unreferenced blobs
-	if err := fs.BlobGC(); err != nil {
-		log.Printf("GC failed: %v", err)
-	}
+result, err := store.Put(ctx, tenantID, path, reader, metadata)
+info, err := store.StatObject(ctx, tenantID, path)
+reader, err := store.OpenObject(ctx, tenantID, path)
+rangeReader, err := store.OpenRange(ctx, tenantID, path, offset, length)
+info, err = store.UpdateMetadata(ctx, tenantID, path, metadata)
+err = store.DeleteObject(ctx, tenantID, path)
 ```
 
-## Architecture
+Object metadata is a `map[string]string`. `UpdateMetadata` replaces metadata without rewriting content or changing the manifest.
 
-*   **Blob Storage:** Raw file data is stored in a content-addressable `blob` directory.
-*   **Metadata:** File metadata (mapping path to blob hash) is stored in a `meta` directory.
-*   **Locking:** A fine-grained `rwLockGroup` manages access to individual files, while a global `gcLocker` coordinates garbage collection and blob deletion.
+Nested object paths require explicit parent directories. Create them through the VFS API before calling `Put`.
+
+## Afero Filesystem
+
+`Store` implements `afero.Fs`. VFS paths use `tenant/path` form.
+
+```go
+fs, err := blobfs.OpenFS(afero.NewMemMapFs(), "/blobfs", blobfs.DefaultConfig())
+if err != nil {
+	log.Fatal(err)
+}
+defer fs.Close()
+
+if err := fs.MkdirAll("tenant-a/docs", 0o755); err != nil {
+	log.Fatal(err)
+}
+if err := afero.WriteFile(fs, "tenant-a/docs/file.txt", []byte("hello"), 0o644); err != nil {
+	log.Fatal(err)
+}
+```
+
+Directory records, mode, mtime, uid, and gid are stored in BlobFS metadata.
+
+Directories are explicit; BlobFS does not synthesize missing parents from object names. Writable VFS handles commit through temporary write sessions and fail with `ErrConflict` if the file generation changed while the handle was open.
+
+## Standard Library FS
+
+Use `TenantFS` when a consumer expects `io/fs.FS`:
+
+```go
+tenant := store.TenantFS("tenant-a")
+data, err := fs.ReadFile(tenant, "docs/file.txt")
+```
+
+## Integrity and GC
+
+```go
+check, err := store.CheckObject(ctx, tenantID, path)
+scrub, err := store.Scrub(ctx, blobfs.ScrubOptions{CheckFiles: true})
+gc, err := store.RunGC(ctx, blobfs.GCOptions{Compact: true})
+```
+
+Integrity checks verify manifest references, chunk metadata, segment records, payload checksums, decompressed sizes, chunk hashes, and file hashes. Corrupt chunks and segments are marked `CORRUPT` and are not reused for reads or deduplication.
+
+## Configuration
+
+```go
+cfg := blobfs.DefaultConfig()
+cfg.LargeFileThreshold = 64 << 20
+cfg.SegmentSize = 256 << 20
+cfg.MaxFileSize = 1 << 40
+cfg.GC.CompactGarbageRatio = 0.6
+
+store, err := blobfs.Open("./data/blobfs", cfg)
+```
+
+Defaults:
+
+- `LargeFileThreshold`: 64 MiB
+- `SegmentSize`: 256 MiB
+- `MaxFileSize`: 1 TiB
+- `MaxTenantLength`: 128 bytes
+- `MaxPathLength`: 4096 bytes
+- `MaxComponentLength`: 255 bytes
+- `MaxOpenWriteSessions`: 1024
+- `Compression`: zstd
+- `Checksum`: CRC32C
+- `DedupScope`: tenant
+- `Chunking`: FastCDC
+- `GC.SafetyWindow`: 24h
+- `GC.CandidateConfirmCycles`: 2
+- `GC.SegmentDeleteDelay`: 24h
+- `GC.CompactGarbageRatio`: 0.6
+
+## Storage Layout
+
+```text
+base/
+  meta/
+    blobfs.json
+    LOCK
+  data/
+    segments/
+      0000/
+        0000/
+          0000000000000001.blob
+          0000000000000002.blob
+  tmp/
+    write-sessions/
+```
+
+Metadata is persisted as an atomically replaced JSON file. Segment files are numeric `.blob` files and are written without executable bits.
+
+## Testing
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+## Documentation
+
+See [DOCS.md](./DOCS.md) for the core design.
 
 ## License
 
-This project is licensed under the [Apache-2.0](./LICENSE) license.
+BlobFS is licensed under the [Apache License 2.0](./LICENSE).
