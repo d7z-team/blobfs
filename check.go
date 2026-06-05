@@ -242,6 +242,8 @@ func (s *Store) checkChunkSnapshot(snap chunkCheckSnapshot) ([]byte, *CheckIssue
 		kind := "chunk_read_failed"
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 			kind = "segment_read_failed"
+		} else if errors.Is(err, errChunkHashMismatch) {
+			kind = "chunk_hash_mismatch"
 		}
 		return nil, &CheckIssue{Kind: kind, Path: snap.Path, TenantID: snap.TenantID, ChunkID: snap.Chunk.ChunkID, SegmentID: snap.Segment.SegmentID, Reason: err.Error()}
 	}

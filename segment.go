@@ -26,6 +26,8 @@ const (
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
+var errChunkHashMismatch = errors.New("chunk hash mismatch")
+
 type segmentBatchWriter struct {
 	store    *Store
 	current  *preparedSegment
@@ -259,6 +261,10 @@ func (s *Store) readChunkPayloadAt(seg segmentRecord, chunk chunkRecord) ([]byte
 	}
 	if int64(len(raw)) != rawSize || rawSize != chunk.RawSize {
 		return nil, errors.New("segment record raw size mismatch")
+	}
+	gotChunkID := hashBytes(chunk.TenantID, chunk.TenantID != "", raw)
+	if gotChunkID != chunk.ChunkID {
+		return nil, fmt.Errorf("%w: want %s got %s", errChunkHashMismatch, chunk.ChunkID, gotChunkID)
 	}
 	return raw, nil
 }

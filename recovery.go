@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/afero"
@@ -191,6 +192,29 @@ type RepairAction struct {
 	Target  string
 	Applied bool
 	Message string
+}
+
+// RemoveStaleLock removes a stale store lock on the local filesystem.
+// The caller must first ensure no live process is using the store.
+func RemoveStaleLock(baseDir string) error {
+	baseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return err
+	}
+	return RemoveFSStaleLock(afero.NewOsFs(), baseDir)
+}
+
+// RemoveFSStaleLock removes a stale store lock on an afero filesystem.
+// The caller must first ensure no live process is using the store.
+func RemoveFSStaleLock(filesystem afero.Fs, baseDir string) error {
+	if filesystem == nil {
+		return errors.New("filesystem is nil")
+	}
+	err := filesystem.Remove(filepath.Join(filepath.Clean(baseDir), "meta", "LOCK"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // Health returns a lightweight store health report without scanning all data files.

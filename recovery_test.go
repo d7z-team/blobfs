@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -64,6 +65,66 @@ func TestRecoveryAPIsRejectNilContext(t *testing.T) {
 	}
 	if _, err := store.Repair(nilContext, RepairOptions{}); err == nil {
 		t.Fatal("Repair should reject nil context")
+	}
+}
+
+func TestRemoveStaleLockAllowsExplicitReopen(t *testing.T) {
+	fsys := afero.NewMemMapFs()
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.MkdirAll("tenant-a/lock", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := []byte("lock recovery")
+	putTestBytes(t, store, "tenant-a", "lock/blob", data)
+	if store.metaLog != nil {
+		_ = store.metaLog.Close()
+	}
+	if store.lockFile != nil {
+		_ = store.lockFile.Close()
+	}
+	if _, err := OpenFS(fsys, "/blobfs", testConfig()); err == nil {
+		t.Fatal("stale lock should prevent reopen")
+	}
+	if err := RemoveFSStaleLock(nil, "/blobfs"); err == nil {
+		t.Fatal("nil filesystem should fail")
+	}
+	if err := RemoveFSStaleLock(fsys, "/blobfs"); err != nil {
+		t.Fatalf("remove stale lock: %v", err)
+	}
+	if err := RemoveFSStaleLock(fsys, "/blobfs"); err != nil {
+		t.Fatalf("remove missing stale lock should be idempotent: %v", err)
+	}
+	reopened, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("reopen after stale lock removal: %v", err)
+	}
+	defer reopened.Close()
+	if got := readTestBytes(t, reopened, "tenant-a", "lock/blob"); !bytes.Equal(got, data) {
+		t.Fatalf("recovered data = %q", got)
+	}
+}
+
+func TestRemoveStaleLockLocalFilesystem(t *testing.T) {
+	dir := t.TempDir()
+	lockDir := filepath.Join(dir, "meta")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatalf("mkdir lock dir: %v", err)
+	}
+	lockPath := filepath.Join(lockDir, "LOCK")
+	if err := os.WriteFile(lockPath, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write lock: %v", err)
+	}
+	if err := RemoveStaleLock(dir); err != nil {
+		t.Fatalf("remove stale lock: %v", err)
+	}
+	if _, err := os.Stat(lockPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lock still exists: %v", err)
+	}
+	if err := RemoveStaleLock(dir); err != nil {
+		t.Fatalf("remove missing stale lock should be idempotent: %v", err)
 	}
 }
 

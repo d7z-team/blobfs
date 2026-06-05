@@ -298,6 +298,27 @@ func TestRunGCHonorsSegmentDeleteDelay(t *testing.T) {
 	}
 }
 
+func TestRunGCCompactTrueDeletesFullyDeadSegments(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/gc", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "gc/blob", bytes.Repeat([]byte("dead"), 64))
+	if err := store.DeleteObject(testContext(t), "tenant-a", "gc/blob"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	result, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true})
+	if err != nil {
+		t.Fatalf("compact gc: %v", err)
+	}
+	if result.ChunksDeleted == 0 {
+		t.Fatalf("chunk was not deleted: %+v", result)
+	}
+	if result.SegmentsDeleted == 0 {
+		t.Fatalf("dead segment was not deleted with Compact=true: %+v", result)
+	}
+}
+
 func TestCompactionKeepsPinnedSourceSegmentUntilNextGC(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/pinned", 0o755); err != nil {

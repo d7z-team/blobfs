@@ -1,9 +1,12 @@
 package blobfs
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"io"
+	"os"
 	"testing"
 )
 
@@ -47,5 +50,59 @@ func TestSegmentRelativePathFanoutBoundaries(t *testing.T) {
 		if got := segmentRelativePath(seq); got != want {
 			t.Fatalf("segment path for %d = %q, want %q", seq, got, want)
 		}
+	}
+}
+
+func TestReadPathRejectsChunkHashMismatch(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/hash", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "hash/blob", bytes.Repeat([]byte("A"), 128))
+	store.metaMu.RLock()
+	inode, err := store.resolvePathLocked("tenant-a", "hash/blob")
+	if err != nil {
+		store.metaMu.RUnlock()
+		t.Fatalf("resolve: %v", err)
+	}
+	manifest := store.meta.Manifests[inode.ManifestID]
+	chunk := *store.meta.Chunks[manifest.Chunks[0].ChunkID]
+	segment := *store.meta.Segments[chunk.SegmentID]
+	store.metaMu.RUnlock()
+
+	badRaw := bytes.Repeat([]byte("B"), int(chunk.RawSize))
+	payload, err := compressZstd(badRaw)
+	if err != nil {
+		t.Fatalf("compress bad raw: %v", err)
+	}
+	checksum := crc32.Checksum(payload, crc32cTable)
+	header := makeRecordHeader(chunk.ChunkID, int64(len(badRaw)), int64(len(payload)), checksum)
+	file, err := store.fs.OpenFile(store.segmentPath(&segment), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open segment: %v", err)
+	}
+	if _, err := file.WriteAt(header, chunk.SegmentOffset); err != nil {
+		_ = file.Close()
+		t.Fatalf("write bad header: %v", err)
+	}
+	if _, err := file.WriteAt(payload, chunk.SegmentOffset+recordHeaderSize); err != nil {
+		_ = file.Close()
+		t.Fatalf("write bad payload: %v", err)
+	}
+	_ = file.Close()
+	store.metaMu.Lock()
+	current := store.meta.Chunks[chunk.ChunkID]
+	current.StoredSize = int64(len(payload))
+	current.SegmentLength = int64(recordHeaderSize + len(payload))
+	current.ChecksumCRC32C = checksum
+	store.metaMu.Unlock()
+
+	reader, err := store.OpenObject(testContext(t), "tenant-a", "hash/blob")
+	if err != nil {
+		t.Fatalf("open object: %v", err)
+	}
+	defer reader.Close()
+	if _, err := io.ReadAll(reader); !errors.Is(err, errChunkHashMismatch) {
+		t.Fatalf("hash-mismatched read = %v, want errChunkHashMismatch", err)
 	}
 }

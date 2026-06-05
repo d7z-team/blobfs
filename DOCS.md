@@ -250,7 +250,7 @@ Range 读取：
 4. 返回 reader
 ```
 
-读取会拒绝不可读的 chunk 和 segment 状态。
+读取会拒绝不可读的 chunk 和 segment 状态，并在返回 bytes 前校验 record header、payload length、CRC32C、解压后大小和 CAS chunk hash。
 
 ## 元数据更新
 
@@ -352,7 +352,7 @@ ResetCompacting:    将残留 COMPACTING segment 恢复为 SEALED
 MarkMissingCorrupt: segment 文件缺失时标记相关 segment/chunk 为 CORRUPT
 ```
 
-高风险动作不在薄 API 中自动执行：不截断 txlog、不删除 LOCK、不重建 manifest、不猜测缺失 chunk 内容。
+高风险动作不在 `Repair` 中自动执行：不截断 txlog、不重建 manifest、不猜测缺失 chunk 内容。异常退出残留的 `LOCK` 会阻止 reopen；确认没有存活进程持有该 store 后，可显式调用 `RemoveStaleLock(baseDir)` 或 `RemoveFSStaleLock(fs, baseDir)` 删除 stale lock。
 
 ## VFS
 

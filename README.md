@@ -135,11 +135,12 @@ health, err := store.Health(ctx)
 stats, err := store.Stats(ctx)
 diagnose, err := store.Diagnose(ctx, blobfs.DiagnoseOptions{CheckFiles: true})
 repair, err := store.Repair(ctx, blobfs.RepairOptions{DryRun: true, CleanStaging: true})
+err = blobfs.RemoveStaleLock("./data/blobfs") // only after confirming no live process owns the store
 ```
 
-Integrity checks verify manifest references, chunk metadata, segment records, payload checksums, decompressed sizes, chunk hashes, and file hashes. Corrupt chunks and segments are marked `CORRUPT` and are not reused for reads or deduplication.
+Reads verify segment records, payload checksums, decompressed sizes, and chunk hashes before returning bytes. Integrity checks additionally verify manifest references, chunk metadata, and file hashes. Corrupt chunks and segments are marked `CORRUPT` and are not reused for reads or deduplication.
 
-`Health` and `Stats` are lightweight metadata-oriented APIs. `Diagnose` can optionally scan segment and staging directories. `Repair` only performs low-risk actions selected by `RepairOptions`; it defaults to dry-run and executes only when `Apply` is true.
+`Health` and `Stats` are lightweight metadata-oriented APIs. `Diagnose` can optionally scan segment and staging directories. `Repair` only performs low-risk actions selected by `RepairOptions`; it defaults to dry-run and executes only when `Apply` is true. `RemoveStaleLock` is a standalone crash-recovery helper and must only be called after external ownership checks.
 
 ## Configuration
 

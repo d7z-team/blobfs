@@ -81,6 +81,8 @@ type preparedObject struct {
 	refs         []manifestChunk
 	chunks       map[string]*chunkRecord
 	segments     []*segmentRecord
+	pinned       []string
+	reusedChunks map[string]bool
 	manifest     *manifestRecord
 }
 
@@ -196,6 +198,7 @@ func (s *Store) putObject(ctx context.Context, tenantID, path string, input io.R
 	if err != nil {
 		return nil, err
 	}
+	defer s.releasePreparedPins(prepared)
 	result, err := s.commitPreparedObject(ctx, prepared, opts)
 	if err != nil {
 		var commitErr metadataCommitError
@@ -212,11 +215,18 @@ func (s *Store) prepareObject(ctx context.Context, tenantID, path string, input 
 	scoped := scopeID != ""
 	fileHasher := scopedHasher(scopeID, scoped)
 	prepared := &preparedObject{
-		tenantID: tenantID,
-		path:     path,
-		scopeID:  scopeID,
-		chunks:   map[string]*chunkRecord{},
+		tenantID:     tenantID,
+		path:         path,
+		scopeID:      scopeID,
+		chunks:       map[string]*chunkRecord{},
+		reusedChunks: map[string]bool{},
 	}
+	success := false
+	defer func() {
+		if !success {
+			s.releasePreparedPins(prepared)
+		}
+	}()
 	writer := &segmentBatchWriter{store: s}
 	defer writer.cleanup()
 	if err := s.streamChunks(ctx, input, fileHasher, func(offset int64, raw []byte) error {
@@ -229,8 +239,10 @@ func (s *Store) prepareObject(ctx context.Context, tenantID, path string, input 
 			prepared.size += int64(len(raw))
 			return nil
 		}
-		if existing := s.chunkSnapshot(chunkID); existing != nil {
+		if existing := s.pinChunkSnapshot(chunkID); existing != nil {
 			prepared.chunks[chunkID] = existing
+			prepared.pinned = append(prepared.pinned, existing.SegmentID)
+			prepared.reusedChunks[chunkID] = true
 			prepared.refs = append(prepared.refs, manifestChunk{Index: len(prepared.refs), ChunkID: chunkID, FileOffset: offset, ChunkSize: int64(len(raw))})
 			prepared.size += int64(len(raw))
 			return nil
@@ -273,6 +285,7 @@ func (s *Store) prepareObject(ctx context.Context, tenantID, path string, input 
 		CreatedAt:    now,
 		LastLiveAt:   now,
 	}
+	success = true
 	return prepared, nil
 }
 
@@ -384,6 +397,14 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 		}
 	}
 	now := nowUnix()
+	for chunkID := range prepared.reusedChunks {
+		chunk := prepared.chunks[chunkID]
+		current := s.meta.Chunks[chunkID]
+		segment := s.meta.Segments[chunk.SegmentID]
+		if current == nil || current.State == chunkStateCorrupt || segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateCorrupt {
+			return nil, errors.New("reused chunk is no longer readable")
+		}
+	}
 	ops := make([]metaOp, 0, len(prepared.segments)+len(prepared.chunks)+4)
 	for _, seg := range prepared.segments {
 		segCopy := *seg
@@ -776,13 +797,18 @@ func (s *Store) resolveParentLocked(tenantID, path string) (uint64, string, erro
 	return inode.InodeID, name, nil
 }
 
-func (s *Store) chunkSnapshot(chunkID string) *chunkRecord {
+func (s *Store) pinChunkSnapshot(chunkID string) *chunkRecord {
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
 	chunk := s.meta.Chunks[chunkID]
 	if chunk == nil || chunk.State == chunkStateDeleted || chunk.State == chunkStateCorrupt {
 		return nil
 	}
+	segment := s.meta.Segments[chunk.SegmentID]
+	if segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateCorrupt {
+		return nil
+	}
+	s.pinSegment(chunk.SegmentID)
 	next := *chunk
 	return &next
 }
@@ -916,6 +942,16 @@ func (s *Store) segmentPinned(segmentID string) bool {
 	s.pinMu.Lock()
 	defer s.pinMu.Unlock()
 	return s.pins[segmentID] > 0
+}
+
+func (s *Store) releasePreparedPins(prepared *preparedObject) {
+	if prepared == nil {
+		return
+	}
+	for _, segmentID := range prepared.pinned {
+		s.unpinSegment(segmentID)
+	}
+	prepared.pinned = nil
 }
 
 func (s *Store) removePreparedSegments(prepared *preparedObject) {

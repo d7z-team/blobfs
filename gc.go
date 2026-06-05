@@ -76,9 +76,8 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 			s.metaMu.Unlock()
 			return nil, err
 		}
-	} else {
-		removeSegments = s.collectDeadSegmentsLocked(segmentDeleteCutoff)
 	}
+	removeSegments = s.collectDeadSegmentsLocked(segmentDeleteCutoff)
 	s.metaMu.Unlock()
 
 	if len(compactCandidates) > 0 {

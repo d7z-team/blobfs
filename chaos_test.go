@@ -286,6 +286,67 @@ func TestChaosMixedObjectAndVFSOperations(t *testing.T) {
 	}
 }
 
+func TestChaosPutReuseInterleavedWithAggressiveGC(t *testing.T) {
+	cfg := testConfig()
+	cfg.SegmentSize = 512
+	store, err := Open(t.TempDir(), cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/reuse", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	rng := rand.New(rand.NewSource(0x51A7E))
+	for step := 0; step < 40; step++ {
+		data := chaosBytes(rng)
+		oldPath := fmt.Sprintf("reuse/old-%02d", step)
+		newPath := fmt.Sprintf("reuse/new-%02d", step)
+		putTestBytes(t, store, "tenant-a", oldPath, data)
+		if err := store.DeleteObject(testContext(t), "tenant-a", oldPath); err != nil {
+			t.Fatalf("step %d delete old: %v", step, err)
+		}
+		prepared, err := store.prepareObject(testContext(t), "tenant-a", newPath, bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("step %d prepare: %v", step, err)
+		}
+		if len(prepared.pinned) == 0 {
+			store.releasePreparedPins(prepared)
+			t.Fatalf("step %d expected reused chunk pin", step)
+		}
+		if _, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
+			store.releasePreparedPins(prepared)
+			t.Fatalf("step %d gc: %v", step, err)
+		}
+		if _, err := store.commitPreparedObject(testContext(t), prepared, putCommitOptions{}); err != nil {
+			store.releasePreparedPins(prepared)
+			t.Fatalf("step %d commit: %v", step, err)
+		}
+		store.releasePreparedPins(prepared)
+		if got := readTestBytes(t, store, "tenant-a", newPath); !bytes.Equal(got, data) {
+			t.Fatalf("step %d committed data mismatch", step)
+		}
+		if step%5 == 0 {
+			if _, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
+				t.Fatalf("step %d follow-up gc: %v", step, err)
+			}
+		}
+	}
+	store.pinMu.Lock()
+	pins := len(store.pins)
+	store.pinMu.Unlock()
+	if pins != 0 {
+		t.Fatalf("prepared chunk pins leaked: %d", pins)
+	}
+	scrub, err := store.Scrub(testContext(t), ScrubOptions{CheckFiles: true})
+	if err != nil {
+		t.Fatalf("scrub: %v", err)
+	}
+	if !scrub.Healthy {
+		t.Fatalf("scrub found issues: %+v", scrub)
+	}
+}
+
 func chaosPath(rng *rand.Rand) string {
 	return fmt.Sprintf("chaos/%c/file-%02d", 'a'+rng.Intn(3), rng.Intn(16))
 }
