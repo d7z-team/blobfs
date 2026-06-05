@@ -10,12 +10,12 @@ BlobFS is a local content-addressed file storage library for Go. It stores files
 ## Features
 
 - SHA-256 content addressing and deduplication.
-- Single-chunk storage for files at or below `LargeFileThreshold`.
-- FastCDC-style chunking for large files.
+- Streaming FastCDC-style content-defined chunking.
 - Append-only segment files with fixed two-level fanout.
 - Tombstone deletes with asynchronous GC and compaction.
 - Object range reads.
 - Metadata-only updates.
+- Metadata-only large directory `Rename` and `RemoveAll`; child subtrees are not synchronously rewritten.
 - Object and store integrity checks.
 - Explicit directory records with directory indexes.
 - Generation-checked VFS writes to avoid silent lost updates.
@@ -114,7 +114,7 @@ if err := afero.WriteFile(fs, "tenant-a/docs/file.txt", []byte("hello"), 0o644);
 
 Directory records, mode, mtime, uid, and gid are stored in BlobFS metadata.
 
-Directories are explicit; BlobFS does not synthesize missing parents from object names. Writable VFS handles commit through temporary write sessions and fail with `ErrConflict` if the file generation changed while the handle was open.
+Directories are explicit; BlobFS does not synthesize missing parents from object names. Writable VFS handles commit through temporary write sessions, enforces `MaxOpenWriteSessions`, and fails with `ErrConflict` if the file generation changed while the handle was open.
 
 ## Standard Library FS
 
@@ -131,15 +131,20 @@ data, err := fs.ReadFile(tenant, "docs/file.txt")
 check, err := store.CheckObject(ctx, tenantID, path)
 scrub, err := store.Scrub(ctx, blobfs.ScrubOptions{CheckFiles: true})
 gc, err := store.RunGC(ctx, blobfs.GCOptions{Compact: true})
+health, err := store.Health(ctx)
+stats, err := store.Stats(ctx)
+diagnose, err := store.Diagnose(ctx, blobfs.DiagnoseOptions{CheckFiles: true})
+repair, err := store.Repair(ctx, blobfs.RepairOptions{DryRun: true, CleanStaging: true})
 ```
 
 Integrity checks verify manifest references, chunk metadata, segment records, payload checksums, decompressed sizes, chunk hashes, and file hashes. Corrupt chunks and segments are marked `CORRUPT` and are not reused for reads or deduplication.
+
+`Health` and `Stats` are lightweight metadata-oriented APIs. `Diagnose` can optionally scan segment and staging directories. `Repair` only performs low-risk actions selected by `RepairOptions`; it defaults to dry-run and executes only when `Apply` is true.
 
 ## Configuration
 
 ```go
 cfg := blobfs.DefaultConfig()
-cfg.LargeFileThreshold = 64 << 20
 cfg.SegmentSize = 256 << 20
 cfg.MaxFileSize = 1 << 40
 cfg.GC.CompactGarbageRatio = 0.6
@@ -149,7 +154,6 @@ store, err := blobfs.Open("./data/blobfs", cfg)
 
 Defaults:
 
-- `LargeFileThreshold`: 64 MiB
 - `SegmentSize`: 256 MiB
 - `MaxFileSize`: 1 TiB
 - `MaxTenantLength`: 128 bytes
@@ -170,19 +174,22 @@ Defaults:
 ```text
 base/
   meta/
-    blobfs.json
     LOCK
+    SUPER0
+    SUPER1
+    checkpoint.json
+    txlog/
+      000001.log
   data/
     segments/
       0000/
         0000/
           0000000000000001.blob
           0000000000000002.blob
-  tmp/
-    write-sessions/
+    staging/
 ```
 
-Metadata is persisted as an atomically replaced JSON file. Segment files are numeric `.blob` files and are written without executable bits.
+Metadata is persisted as typed inode/dentry transactions in an append-only metadata log. Periodic checkpoints compact the log for bounded startup replay. Segment files are numeric `.blob` files and object data is staged before metadata makes it visible.
 
 ## Testing
 

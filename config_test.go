@@ -8,7 +8,7 @@ func TestOpenNormalizesZeroConfig(t *testing.T) {
 		t.Fatalf("open with zero config: %v", err)
 	}
 	defer store.Close()
-	if store.cfg.LargeFileThreshold != DefaultConfig().LargeFileThreshold {
+	if store.cfg.SegmentSize != DefaultConfig().SegmentSize {
 		t.Fatalf("zero config should apply defaults: %+v", store.cfg)
 	}
 }
@@ -22,7 +22,6 @@ func TestOpenRejectsUnsupportedConfig(t *testing.T) {
 		{name: "checksum", edit: func(cfg *Config) { cfg.Checksum = "sha256" }},
 		{name: "dedup scope", edit: func(cfg *Config) { cfg.DedupScope = "all" }},
 		{name: "chunking", edit: func(cfg *Config) { cfg.Chunking.Algorithm = "rabin" }},
-		{name: "file threshold", edit: func(cfg *Config) { cfg.LargeFileThreshold = -1 }},
 		{name: "segment size", edit: func(cfg *Config) { cfg.SegmentSize = -1 }},
 		{name: "chunk sizes", edit: func(cfg *Config) { cfg.Chunking.MinSize = cfg.Chunking.MaxSize + 1 }},
 		{name: "gc cycles", edit: func(cfg *Config) { cfg.GC.CandidateConfirmCycles = -1 }},

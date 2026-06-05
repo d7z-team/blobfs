@@ -8,22 +8,24 @@ import (
 
 // ObjectReader reads an immutable snapshot of a file's manifest and chunks.
 type ObjectReader struct {
-	store    *Store
-	size     int64
-	offset   int64
-	limitEnd int64
-	refs     []chunkSnapshot
-	buf      []byte
-	bufStart int64
-	bufEnd   int64
-	closed   bool
-	fileHash string
-	info     ObjectInfo
+	store          *Store
+	size           int64
+	offset         int64
+	limitEnd       int64
+	refs           []chunkSnapshot
+	buf            []byte
+	bufStart       int64
+	bufEnd         int64
+	closed         bool
+	fileHash       string
+	info           ObjectInfo
+	pinnedSegments []string
 }
 
 type chunkSnapshot struct {
-	Ref   manifestChunk
-	Chunk chunkRecord
+	Ref     manifestChunk
+	Chunk   chunkRecord
+	Segment segmentRecord
 }
 
 func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64) (*ObjectReader, error) {
@@ -34,53 +36,68 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 	if err != nil {
 		return nil, pathError("open", path, err)
 	}
-	lock := s.pathLocks.Open(fileKey(tenantID, path)).Lock(true)
-	defer lock.Close()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	file, info, err := s.activeFileInfoLocked(tenantID, path)
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	inode, err := s.resolvePathLocked(tenantID, path)
 	if err != nil {
 		return nil, pathError("open", path, err)
 	}
-	manifest := s.meta.Manifests[file.ManifestID]
-	if manifest == nil {
+	if inode.Kind != fileKindFile {
+		return nil, pathError("open", path, ErrIsDir)
+	}
+	manifest := s.meta.Manifests[inode.ManifestID]
+	if manifest == nil || manifest.State == manifestStateDeleted {
 		return nil, errors.New("manifest not found")
 	}
-	refs := s.manifestRefs(manifest)
+	refs := append([]manifestChunk(nil), manifest.Chunks...)
 	sort.Slice(refs, func(i, j int) bool {
 		return refs[i].FileOffset < refs[j].FileOffset
 	})
 	snapshots := make([]chunkSnapshot, 0, len(refs))
 	for _, ref := range refs {
 		chunk := s.meta.Chunks[ref.ChunkID]
-		if chunk == nil || chunk.State == chunkStateDeleted || chunk.State == chunkStateDeleting || chunk.State == chunkStateCorrupt {
+		if chunk == nil || chunk.State == chunkStateDeleted || chunk.State == chunkStateCorrupt {
 			return nil, errors.New("chunk not readable")
 		}
 		seg := s.meta.Segments[chunk.SegmentID]
 		if seg == nil || seg.State == segmentStateDeleted || seg.State == segmentStateCorrupt {
 			return nil, errors.New("chunk not readable")
 		}
-		snapshots = append(snapshots, chunkSnapshot{Ref: ref, Chunk: *chunk})
+		snapshots = append(snapshots, chunkSnapshot{Ref: ref, Chunk: *chunk, Segment: *seg})
 	}
-	if rangeOffset > file.Size {
+	pinned := make([]string, 0, len(snapshots))
+	seenPins := map[string]bool{}
+	for _, snap := range snapshots {
+		if seenPins[snap.Segment.SegmentID] {
+			continue
+		}
+		seenPins[snap.Segment.SegmentID] = true
+		s.pinSegment(snap.Segment.SegmentID)
+		pinned = append(pinned, snap.Segment.SegmentID)
+	}
+	if rangeOffset > inode.Size {
+		for _, segmentID := range pinned {
+			s.unpinSegment(segmentID)
+		}
 		return nil, io.EOF
 	}
-	limitEnd := file.Size
+	limitEnd := inode.Size
 	if rangeLength >= 0 {
-		if rangeLength > file.Size-rangeOffset {
-			limitEnd = file.Size
+		if rangeLength > inode.Size-rangeOffset {
+			limitEnd = inode.Size
 		} else {
 			limitEnd = rangeOffset + rangeLength
 		}
 	}
 	return &ObjectReader{
-		store:    s,
-		size:     file.Size,
-		offset:   rangeOffset,
-		limitEnd: limitEnd,
-		refs:     snapshots,
-		fileHash: file.FileHash,
-		info:     info,
+		store:          s,
+		size:           inode.Size,
+		offset:         rangeOffset,
+		limitEnd:       limitEnd,
+		refs:           snapshots,
+		fileHash:       inode.FileHash,
+		info:           objectInfoFromInode(inode, path),
+		pinnedSegments: pinned,
 	}, nil
 }
 
@@ -149,6 +166,12 @@ func (r *ObjectReader) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (r *ObjectReader) Close() error {
+	if !r.closed {
+		for _, segmentID := range r.pinnedSegments {
+			r.store.unpinSegment(segmentID)
+		}
+		r.pinnedSegments = nil
+	}
 	r.closed = true
 	r.buf = nil
 	return nil
@@ -169,7 +192,7 @@ func (r *ObjectReader) loadChunkAtOffset(offset int64) error {
 		start := ref.Ref.FileOffset
 		end := start + ref.Ref.ChunkSize
 		if offset >= start && offset < end {
-			data, err := r.store.readChunkPayload(ref.Chunk)
+			data, err := r.store.readChunkPayloadAt(ref.Segment, ref.Chunk)
 			if err != nil {
 				return err
 			}

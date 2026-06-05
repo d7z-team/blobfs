@@ -51,14 +51,6 @@ func normalizePath(path string, cfg Config) (string, error) {
 	return strings.Join(clean, "/"), nil
 }
 
-func fileKey(tenantID, path string) string {
-	return tenantID + "\x00" + path
-}
-
-func dirKey(tenantID, path string) string {
-	return tenantID + "\x00" + path
-}
-
 func pathBase(path string) string {
 	if path == "" {
 		return ""
@@ -67,4 +59,11 @@ func pathBase(path string) string {
 		return path[i+1:]
 	}
 	return path
+}
+
+func parentPath(path string) string {
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		return path[:i]
+	}
+	return ""
 }

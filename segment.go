@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	segmentHeaderMagic = "BLOBFSSEG1\n"
-	recordMagic        = uint32(0x31465342)
-	recordVersion      = uint16(1)
+	segmentHeaderMagic = "BLOBFSSEG2\n"
+	recordMagic        = uint32(0x32465342)
+	recordVersion      = uint16(2)
 	recordHeaderSize   = 104
 
 	compressionZstdID = uint32(1)
@@ -26,115 +26,144 @@ const (
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
-type chunkLocation struct {
-	SegmentID     string
-	SegmentOffset int64
-	SegmentLength int64
-	StoredSize    int64
-	Checksum      uint32
-	Compression   string
+type segmentBatchWriter struct {
+	store    *Store
+	current  *preparedSegment
+	segments []*segmentRecord
+}
+
+type preparedSegment struct {
+	record      *segmentRecord
+	file        afero.File
+	stagingPath string
 }
 
 func (s *Store) segmentPath(seg *segmentRecord) string {
 	return filepath.Join(s.segmentsDir, seg.RelativePath)
 }
 
-func (s *Store) createSegmentLocked() (*segmentRecord, error) {
+func (s *Store) stagingSegmentPath(seg *segmentRecord) string {
+	return filepath.Join(s.stagingDir, seg.RelativePath)
+}
+
+func (s *Store) newSegmentRecord() *segmentRecord {
+	s.metaMu.Lock()
 	seq := s.meta.NextSegmentSeq
 	s.meta.NextSegmentSeq++
+	s.metaMu.Unlock()
 	id := fmt.Sprintf("%016d", seq)
-	seg := &segmentRecord{
+	return &segmentRecord{
 		SegmentID:    id,
 		RelativePath: segmentRelativePath(seq),
 		WriteOffset:  int64(len(segmentHeaderMagic)),
-		State:        segmentStateOpen,
+		State:        segmentStateSealed,
 		CreatedAt:    nowUnix(),
 	}
-	if err := s.fs.MkdirAll(filepath.Dir(s.segmentPath(seg)), 0o755); err != nil {
-		return nil, err
-	}
-	file, err := s.fs.OpenFile(s.segmentPath(seg), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if _, err = file.Write([]byte(segmentHeaderMagic)); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	if err = file.Sync(); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	if err = file.Close(); err != nil {
-		return nil, err
-	}
-	s.meta.Segments[id] = seg
-	return seg, nil
 }
 
-func (s *Store) appendChunkRecordLocked(chunkID string, raw []byte) (chunkLocation, error) {
+func (w *segmentBatchWriter) appendChunk(scopeID, chunkID string, raw []byte) (chunkRecord, error) {
 	payload, err := compressZstd(raw)
 	if err != nil {
-		return chunkLocation{}, err
+		return chunkRecord{}, err
 	}
 	recordLen := int64(recordHeaderSize + len(payload))
-	seg := s.openSegmentLocked()
-	if seg == nil || (seg.WriteOffset > int64(len(segmentHeaderMagic)) && seg.WriteOffset+recordLen > s.cfg.SegmentSize) {
-		if seg != nil && seg.State == segmentStateOpen {
-			seg.State = segmentStateSealed
-			seg.SealedAt = nowUnix()
-		}
-		seg, err = s.createSegmentLocked()
-		if err != nil {
-			return chunkLocation{}, err
+	if w.current == nil || (w.current.record.WriteOffset > int64(len(segmentHeaderMagic)) && w.current.record.WriteOffset+recordLen > w.store.cfg.SegmentSize) {
+		if err := w.rotate(); err != nil {
+			return chunkRecord{}, err
 		}
 	}
-	checksum := crc32.Checksum(payload, crc32cTable)
+	seg := w.current.record
 	offset := seg.WriteOffset
+	checksum := crc32.Checksum(payload, crc32cTable)
 	header := makeRecordHeader(chunkID, int64(len(raw)), int64(len(payload)), checksum)
-	file, err := s.fs.OpenFile(s.segmentPath(seg), os.O_WRONLY, 0o600)
-	if err != nil {
-		return chunkLocation{}, err
+	if _, err := w.current.file.Write(header); err != nil {
+		return chunkRecord{}, err
 	}
-	if _, err = file.Seek(offset, io.SeekStart); err != nil {
-		_ = file.Close()
-		return chunkLocation{}, err
-	}
-	if _, err = file.Write(header); err != nil {
-		_ = file.Close()
-		return chunkLocation{}, err
-	}
-	if _, err = file.Write(payload); err != nil {
-		_ = file.Close()
-		return chunkLocation{}, err
-	}
-	if err = file.Sync(); err != nil {
-		_ = file.Close()
-		return chunkLocation{}, err
-	}
-	if err = file.Close(); err != nil {
-		return chunkLocation{}, err
+	if _, err := w.current.file.Write(payload); err != nil {
+		return chunkRecord{}, err
 	}
 	seg.WriteOffset += recordLen
 	seg.TotalBytes += recordLen
-	seg.LiveBytesEstimate += int64(len(payload))
-	return chunkLocation{
-		SegmentID:     seg.SegmentID,
-		SegmentOffset: offset,
-		SegmentLength: recordLen,
-		StoredSize:    int64(len(payload)),
-		Checksum:      checksum,
-		Compression:   string(CompressionZstd),
+	now := nowUnix()
+	return chunkRecord{
+		ChunkID:        chunkID,
+		TenantID:       scopeID,
+		RawSize:        int64(len(raw)),
+		StoredSize:     int64(len(payload)),
+		State:          chunkStateActive,
+		SegmentID:      seg.SegmentID,
+		SegmentOffset:  offset,
+		SegmentLength:  recordLen,
+		ChecksumCRC32C: checksum,
+		Compression:    string(CompressionZstd),
+		CreatedAt:      now,
+		LastSeenAt:     now,
 	}, nil
 }
 
-func (s *Store) openSegmentLocked() *segmentRecord {
-	for _, seg := range s.meta.Segments {
-		if seg.State == segmentStateOpen {
-			return seg
+func (w *segmentBatchWriter) rotate() error {
+	if w.current != nil {
+		if err := w.current.file.Sync(); err != nil {
+			return err
+		}
+		if err := w.current.file.Close(); err != nil {
+			return err
+		}
+		w.current = nil
+	}
+	seg := w.store.newSegmentRecord()
+	stagingPath := w.store.stagingSegmentPath(seg)
+	if err := w.store.fs.MkdirAll(filepath.Dir(stagingPath), 0o755); err != nil {
+		return err
+	}
+	file, err := w.store.fs.OpenFile(stagingPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write([]byte(segmentHeaderMagic)); err != nil {
+		_ = file.Close()
+		return err
+	}
+	w.current = &preparedSegment{record: seg, file: file, stagingPath: stagingPath}
+	w.segments = append(w.segments, seg)
+	return nil
+}
+
+func (w *segmentBatchWriter) finish() error {
+	if w.current != nil {
+		if err := w.current.file.Sync(); err != nil {
+			return err
+		}
+		if err := w.current.file.Close(); err != nil {
+			return err
+		}
+		w.current = nil
+	}
+	sealedAt := nowUnix()
+	for _, seg := range w.segments {
+		if seg.SealedAt == 0 {
+			seg.SealedAt = sealedAt
+		}
+		staging := w.store.stagingSegmentPath(seg)
+		final := w.store.segmentPath(seg)
+		if err := w.store.fs.MkdirAll(filepath.Dir(final), 0o755); err != nil {
+			return err
+		}
+		if err := w.store.fs.Rename(staging, final); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func (w *segmentBatchWriter) cleanup() {
+	if w.current != nil {
+		_ = w.current.file.Close()
+		w.current = nil
+	}
+	for _, seg := range w.segments {
+		_ = w.store.fs.Remove(w.store.stagingSegmentPath(seg))
+	}
 }
 
 func segmentRelativePath(seq int64) string {
@@ -144,11 +173,11 @@ func segmentRelativePath(seq int64) string {
 	return filepath.Join(fmt.Sprintf("%04d", first), fmt.Sprintf("%04d", second), fmt.Sprintf("%016d.blob", seq))
 }
 
-func makeRecordHeader(
-	chunkID string,
-	rawSize, storedSize int64,
-	checksum uint32,
-) []byte {
+func sscanfSegmentID(id string, seq *int64) (int, error) {
+	return fmt.Sscanf(id, "%d", seq)
+}
+
+func makeRecordHeader(chunkID string, rawSize, storedSize int64, checksum uint32) []byte {
 	header := make([]byte, recordHeaderSize)
 	binary.LittleEndian.PutUint32(header[0:4], recordMagic)
 	binary.LittleEndian.PutUint16(header[4:6], recordVersion)
@@ -162,9 +191,7 @@ func makeRecordHeader(
 	return header
 }
 
-func parseRecordHeader(
-	header []byte,
-) (
+func parseRecordHeader(header []byte) (
 	chunkID string,
 	rawSize int64,
 	storedSize int64,
@@ -193,16 +220,6 @@ func parseRecordHeader(
 		return "", 0, 0, 0, 0, 0, errors.New("invalid segment payload length")
 	}
 	return chunkID, rawSize, storedSize, compression, checksum, payloadLen, nil
-}
-
-func (s *Store) readChunkPayload(chunk chunkRecord) ([]byte, error) {
-	s.pinSegment(chunk.SegmentID)
-	defer s.unpinSegment(chunk.SegmentID)
-	seg, ok := s.segmentSnapshot(chunk.SegmentID)
-	if !ok {
-		return nil, fmt.Errorf("segment %s not found", chunk.SegmentID)
-	}
-	return s.readChunkPayloadAt(seg, chunk)
 }
 
 func (s *Store) readChunkPayloadAt(seg segmentRecord, chunk chunkRecord) ([]byte, error) {
@@ -262,87 +279,4 @@ func decompressZstd(payload []byte) ([]byte, error) {
 	}
 	defer dec.Close()
 	return io.ReadAll(dec)
-}
-
-func (s *Store) recoverSegmentsLocked() error {
-	for _, seg := range s.meta.Segments {
-		if seg.State == segmentStateDeleted {
-			continue
-		}
-		path := s.segmentPath(seg)
-		file, err := s.fs.OpenFile(path, os.O_RDWR, 0o600)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		validEnd, err := scanSegment(file)
-		if err != nil {
-			_ = file.Close()
-			return err
-		}
-		stat, err := file.Stat()
-		if err != nil {
-			_ = file.Close()
-			return err
-		}
-		if stat.Size() != validEnd {
-			if err = file.Truncate(validEnd); err != nil {
-				_ = file.Close()
-				return err
-			}
-		}
-		_ = file.Close()
-		if seg.WriteOffset > validEnd || seg.WriteOffset == 0 {
-			seg.WriteOffset = validEnd
-		}
-	}
-	return nil
-}
-
-func scanSegment(file afero.File) (int64, error) {
-	stat, err := file.Stat()
-	if err != nil {
-		return 0, err
-	}
-	fileSize := stat.Size()
-	header := make([]byte, len(segmentHeaderMagic))
-	n, err := file.ReadAt(header, 0)
-	if err != nil && err != io.EOF {
-		return 0, err
-	}
-	if n != len(segmentHeaderMagic) || string(header) != segmentHeaderMagic {
-		return 0, errors.New("invalid segment header")
-	}
-	offset := int64(len(segmentHeaderMagic))
-	for {
-		recordHeader := make([]byte, recordHeaderSize)
-		n, err = file.ReadAt(recordHeader, offset)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return offset, nil
-			}
-			return 0, err
-		}
-		if n != recordHeaderSize {
-			return offset, nil
-		}
-		_, _, _, _, checksum, payloadLen, err := parseRecordHeader(recordHeader)
-		if err != nil {
-			return offset, nil
-		}
-		if payloadLen > fileSize-offset-int64(recordHeaderSize) {
-			return offset, nil
-		}
-		payload := make([]byte, payloadLen)
-		n, err = file.ReadAt(payload, offset+recordHeaderSize)
-		if err != nil || int64(n) != payloadLen {
-			return offset, nil
-		}
-		if crc32.Checksum(payload, crc32cTable) != checksum {
-			return offset, nil
-		}
-		offset += int64(recordHeaderSize) + payloadLen
-	}
 }

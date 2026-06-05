@@ -29,27 +29,9 @@ tenant_id/path/to/file
 
 标准库 `io/fs` 消费方使用 `TenantFS(tenantID)`，得到以该租户为根的只读 `fs.FS` 视图。
 
-## 文件分类
+## 文件切分
 
-配置：
-
-```text
-LargeFileThreshold: 64 MiB
-```
-
-当前写入策略：
-
-```text
-size <= LargeFileThreshold:
-  whole-file SHA-256
-  single chunk
-
-size > LargeFileThreshold:
-  FastCDC chunking
-  per-chunk SHA-256
-```
-
-小文件和中等文件都表现为单 chunk manifest。大文件使用 FastCDC，默认参数：
+所有写入都使用同一个流式内容定义切分器，不再维护独立的小文件阈值。输入小于当前 `MaxSize` 时会自然形成单 chunk manifest；更大的输入按 FastCDC-style 边界切分。默认参数：
 
 ```text
 min chunk: 512 KiB
@@ -78,15 +60,18 @@ DedupScopeGlobal:
 ```text
 base/
   meta/
-    blobfs.json
     LOCK
+    SUPER0
+    SUPER1
+    checkpoint.json
+    txlog/
+      000001.log
   data/
     segments/
       0000/
         0000/
           0000000000000001.blob
-  tmp/
-    write-sessions/
+    staging/
 ```
 
 规则：
@@ -117,21 +102,26 @@ payload
 
 ## Metadata
 
-当前元数据存储为原子替换的 JSON 文件：
+当前元数据存储为 typed metadata transaction log：
 
 ```text
-meta/blobfs.json
+meta/SUPER0
+meta/SUPER1
+meta/checkpoint.json
+meta/txlog/000001.log
 ```
 
 核心记录：
 
 ```text
-files:
-  file_id
+tenants:
+  tenant_id -> root inode
+
+inodes:
+  inode_id
   tenant_id
-  path
-  parent_path
   name
+  parent_inode
   kind
   size
   file_hash
@@ -153,7 +143,7 @@ files:
   deleted_at
 
 dir_entries:
-  tenant_id + parent_path -> child_name -> file key
+  parent_inode -> child_name -> child_inode
 
 manifests:
   manifest_id
@@ -164,6 +154,7 @@ manifests:
   chunking_type
   chunks
   state
+  ref_count
   created_at
   last_live_at
   deleted_at
@@ -173,13 +164,16 @@ chunks:
   tenant_id
   raw_size
   stored_size
+  ref_count
   state
   segment_id
   segment_offset
   segment_length
   checksum_crc32c
   compression
-  gc fields
+  garbage_candidate_at
+  garbage_seen_count
+  deleted_at
   corruption fields
 
 segments:
@@ -187,8 +181,6 @@ segments:
   relative_path
   write_offset
   total_bytes
-  live_bytes_estimate
-  garbage_bytes_estimate
   state
   timestamps
 ```
@@ -197,45 +189,46 @@ segments:
 
 ```text
 file:      ACTIVE, DELETED
-file kind: FILE, DIR, SYMLINK
+file kind: FILE, DIR
 manifest:  ACTIVE, DELETED
-chunk:     WRITING, ACTIVE, GARBAGE_CANDIDATE, DELETING, DELETED, CORRUPT
-segment:   OPEN, SEALED, COMPACTING, COMPACTED, DELETED, CORRUPT
+chunk:     ACTIVE, GARBAGE_CANDIDATE, DELETED, CORRUPT
+segment:   SEALED, COMPACTING, DELETED, CORRUPT
 ```
 
-目录是显式元数据记录。BlobFS 不从 `a/b.txt` 自动合成 `a`，所以写入嵌套 object 前必须先创建父目录。目录列表只依赖 `dir_entries`，不扫描全量文件名。
+目录是显式 inode/dentry 记录。BlobFS 不从 `a/b.txt` 自动合成 `a`，所以写入嵌套 object 前必须先创建父目录。目录列表只依赖 `dir_entries`，不扫描全量文件名。目录 rename 移动的是父目录项和目录 inode，不扫描或改写子树。
+
+`checkpoint.json` 是周期性 checkpoint，用来压缩 `txlog/000001.log` 并限制启动 replay 成本。事务先写入 txlog 并 fsync；checkpoint 是后续压缩，不改变已提交事务的可见性。
 
 ## 写入
 
 ```text
 1. 校验 context、tenant、path 和 reader
-2. 校验父目录、文件大小上限和路径长度限制
-3. 读取输入
-4. 计算 scoped file hash
-5. 查找可复用 manifest
-6. 写入缺失 chunk 到 segment
-7. 写 chunk metadata
-8. 写 manifest
-9. 写 file record
-10. 保存 metadata
+2. 流式读取输入并执行 FastCDC chunking
+3. 计算 scoped file hash 和 chunk hash
+4. 将缺失 chunk 写入 staging segment
+5. fsync segment 并 rename 到可见 data/segments
+6. 短 metadata transaction 校验父目录和 generation
+7. 写 chunk、manifest、inode 和 dentry transaction
+8. 周期性更新 checkpoint/SUPER 以压缩 metadata log
 ```
 
 顺序要求：
 
 ```text
-segment payload -> chunk metadata -> manifest -> file record
+staging segment payload -> visible segment -> metadata txlog -> inode visible
 ```
 
-这样 file record 可见时，它引用的 chunk 已经可读。
+这样 inode 可见时，它引用的 chunk 已经可读。
 
 VFS 写入使用临时 write session：
 
 ```text
 OpenFile writable
-  -> 创建 tmp/write-sessions/session-*.tmp
+  -> 创建 data/staging/sessions/session-*.tmp
+  -> 受 MaxOpenWriteSessions 限制，避免无限临时写会话放大
   -> 复制旧内容或从空文件开始
   -> Write/WriteAt/Truncate 修改 session
-  -> Sync/Close 带 base generation 提交
+  -> File.Sync 或 Close 执行一次带 base generation 的提交
 ```
 
 如果打开句柄后同一路径被其他写入修改，提交会返回 `ErrConflict`。新建句柄在关闭前如果同路径已经被创建，也会返回 `ErrConflict`。
@@ -288,9 +281,9 @@ manifest 无 active file 引用时 state = DELETED
 2. 得到 live manifests
 3. 得到 live chunks
 4. 不可达 chunk 第一轮标记 GARBAGE_CANDIDATE
-5. 第二轮仍不可达标记 DELETING
+5. 达到确认轮数后标记 DELETED
 6. segment 垃圾比例达到阈值时 compact
-7. compact 后的 segment 到达延迟窗口后移除
+7. 无 live chunk 的 segment 到达删除延迟窗口后移除
 ```
 
 默认 GC 配置：
@@ -326,6 +319,41 @@ file hash
 
 发现损坏后，相关 chunk 或 segment 会进入 `CORRUPT` 状态，读取和去重复用会避开这些数据。
 
+## 故障恢复与观测
+
+BlobFS core 只提供原始 struct API，不内置 HTTP、Prometheus 或 OpenTelemetry 封装：
+
+```go
+Health(ctx)
+Stats(ctx)
+Diagnose(ctx, opts)
+Repair(ctx, opts)
+```
+
+`Health` 做轻量检查，用于判断 store 是否 open、metadata 是否加载、txlog 和数据目录是否可用、是否存在 corrupt 或 compacting 状态。它不扫描所有 segment。
+
+`Stats` 只从内存 metadata 聚合租户、inode、manifest、chunk、segment、字节和 GC 计数，不触发磁盘扫描。
+
+`Diagnose` 默认无副作用，可按选项扫描：
+
+```text
+CheckFiles:   检查 metadata 引用的 segment 文件是否存在
+CheckOrphans: 扫 data/segments 中未被 metadata 引用的文件
+CheckStaging: 扫 data/staging 残留临时文件
+MaxIssues:    限制返回数量
+```
+
+`Repair` 只支持低风险动作，默认返回 dry-run 计划；只有 `Apply: true` 且未设置 `DryRun` 时才执行：
+
+```text
+CleanStaging:       删除 staging 临时文件
+CleanOrphans:       删除 orphan segment 文件
+ResetCompacting:    将残留 COMPACTING segment 恢复为 SEALED
+MarkMissingCorrupt: segment 文件缺失时标记相关 segment/chunk 为 CORRUPT
+```
+
+高风险动作不在薄 API 中自动执行：不截断 txlog、不删除 LOCK、不重建 manifest、不猜测缺失 chunk 内容。
+
 ## VFS
 
 `*Store` 实现 `afero.Fs`，同时提供 `TenantFS(tenantID) fs.FS`。
@@ -356,6 +384,8 @@ TenantFS
 
 普通文件默认清除执行位。设置 `AllowExecutableFiles` 后，VFS 文件可以保留执行位。目录、mtime、uid、gid 存在 BlobFS 元数据中。
 
+`RemoveAll` 的前台语义是 metadata detach：父目录项立即删除，路径立即不可见。子树内 inode、manifest 和 chunk 引用由后续 GC 扫描不可达 inode 后释放，避免在前台请求中递归遍历海量子树。
+
 安全规则：
 
 ```text
@@ -372,7 +402,6 @@ object path 必须是相对路径
 
 ```go
 type Config struct {
-    LargeFileThreshold   int64
     SegmentSize          int64
     MaxFileSize          int64
     MaxTenantLength      int
@@ -406,7 +435,6 @@ type GCConfig struct {
 
 ```text
 SegmentSize: 256 MiB
-LargeFileThreshold: 64 MiB
 MaxFileSize: 1 TiB
 MaxTenantLength: 128
 MaxPathLength: 4096

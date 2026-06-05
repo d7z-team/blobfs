@@ -3,12 +3,12 @@ package blobfs
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,17 +19,14 @@ const defaultVFSMode = 0o644
 
 var _ afero.Fs = (*Store)(nil)
 
-// Create creates or truncates a BlobFS object through the afero filesystem API.
 func (s *Store) Create(name string) (afero.File, error) {
 	return s.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_RDWR, defaultVFSMode)
 }
 
-// Open opens a BlobFS object or directory through the afero filesystem API.
 func (s *Store) Open(name string) (afero.File, error) {
 	return s.OpenFile(name, os.O_RDONLY, 0)
 }
 
-// OpenFile opens a BlobFS object or directory through the afero filesystem API.
 func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
@@ -42,55 +39,31 @@ func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 		}
 		return s.openDirFile(name, tenantID, path, root)
 	}
-
-	lock := s.pathLocks.Open(fileKey(tenantID, path)).Lock(!writable)
-	s.mu.Lock()
-	record := s.activeRecordLocked(tenantID, path)
-	if record != nil && record.Kind == fileKindDir {
-		s.mu.Unlock()
-		lock.Close()
-		if writable {
-			return nil, pathError("open", name, ErrIsDir)
-		}
-		return s.openDirFile(name, tenantID, path, false)
-	}
-	if record == nil {
+	info, err := s.vfsNodeInfo(tenantID, path)
+	if err != nil {
 		if flag&os.O_CREATE == 0 {
-			s.mu.Unlock()
-			lock.Close()
-			return nil, notExist("open", name)
+			return nil, pathError("open", name, err)
 		}
-		if err := s.ensureParentDirLocked("open", tenantID, path); err != nil {
-			s.mu.Unlock()
-			lock.Close()
+		if err := s.ensureTenantRoot(tenantID); err != nil {
 			return nil, err
 		}
-	} else if flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0 {
-		s.mu.Unlock()
-		lock.Close()
-		return nil, exists("open", name)
-	}
-	mode := s.regularFileMode(perm)
-	modTime := time.Now()
-	baseGeneration := uint64(0)
-	options := map[string]string{}
-	if record != nil {
-		baseGeneration = record.Generation
-		mode = s.regularFileMode(os.FileMode(record.Mode))
-		modTime = time.Unix(0, record.MTime)
-		options = copyOptions(record.Options)
-	}
-	if writable {
-		if s.openWriteSessions >= s.cfg.MaxOpenWriteSessions {
-			s.mu.Unlock()
-			lock.Close()
-			return nil, pathError("open", name, errors.New("too many open write sessions"))
+		s.metaMu.RLock()
+		_, _, parentErr := s.resolveParentLocked(tenantID, path)
+		s.metaMu.RUnlock()
+		if parentErr != nil {
+			return nil, pathError("open", name, parentErr)
 		}
-		s.openWriteSessions++
+	} else {
+		if info.isDir {
+			if writable {
+				return nil, pathError("open", name, ErrIsDir)
+			}
+			return s.openDirFile(name, tenantID, path, false)
+		}
+		if flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0 {
+			return nil, exists("open", name)
+		}
 	}
-	s.mu.Unlock()
-	lock.Close()
-
 	if !writable {
 		reader, err := s.OpenObject(context.Background(), tenantID, path)
 		if err != nil {
@@ -101,30 +74,41 @@ func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 		if err != nil {
 			return nil, err
 		}
-		return &blobVFSFile{name: name, data: data, mode: mode, modTime: modTime}, nil
+		return &blobVFSFile{name: name, data: data, mode: info.mode, modTime: info.modTime}, nil
 	}
-
 	session, sessionName, err := s.createWriteSession()
 	if err != nil {
-		s.releaseWriteSession()
 		return nil, err
 	}
+	cleanupSession := func() {
+		_ = session.Close()
+		_ = s.fs.Remove(sessionName)
+		s.writeSessionMu.Lock()
+		s.openWriteSessions--
+		s.writeSessionMu.Unlock()
+	}
+	baseGeneration := uint64(0)
+	options := map[string]string{}
+	mode := s.regularFileMode(perm)
+	modTime := time.Now()
 	size := int64(0)
-	if record != nil && flag&os.O_TRUNC == 0 {
-		reader, err := s.OpenObject(context.Background(), tenantID, path)
-		if err != nil {
-			_ = session.Close()
-			_ = s.fs.Remove(sessionName)
-			s.releaseWriteSession()
-			return nil, err
-		}
-		size, err = io.Copy(session, reader)
-		_ = reader.Close()
-		if err != nil {
-			_ = session.Close()
-			_ = s.fs.Remove(sessionName)
-			s.releaseWriteSession()
-			return nil, err
+	if info.exists {
+		baseGeneration = info.generation
+		options = copyOptions(info.options)
+		mode = s.regularFileMode(info.mode)
+		modTime = info.modTime
+		if flag&os.O_TRUNC == 0 {
+			reader, err := s.OpenObject(context.Background(), tenantID, path)
+			if err != nil {
+				cleanupSession()
+				return nil, err
+			}
+			size, err = io.Copy(session, reader)
+			_ = reader.Close()
+			if err != nil {
+				cleanupSession()
+				return nil, err
+			}
 		}
 	}
 	offset := int64(0)
@@ -144,13 +128,12 @@ func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 		modTime:        modTime,
 		writable:       true,
 		append:         flag&os.O_APPEND != 0,
-		dirty:          record == nil || flag&(os.O_CREATE|os.O_TRUNC) != 0,
+		dirty:          !info.exists || flag&(os.O_CREATE|os.O_TRUNC) != 0,
 		options:        options,
 		baseGeneration: baseGeneration,
 	}, nil
 }
 
-// Mkdir creates a directory metadata record.
 func (s *Store) Mkdir(name string, perm os.FileMode) error {
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
@@ -159,49 +142,106 @@ func (s *Store) Mkdir(name string, perm os.FileMode) error {
 	if root || path == "" {
 		return exists("mkdir", name)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.activeRecordLocked(tenantID, path) != nil {
-		return exists("mkdir", name)
-	}
-	if err := s.ensureParentDirLocked("mkdir", tenantID, path); err != nil {
+	if err := s.ensureTenantRoot(tenantID); err != nil {
 		return err
 	}
-	s.createDirLocked(tenantID, path, perm)
-	return saveMetadata(s.fs, s.metaPath, s.meta)
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	parentID, base, err := s.resolveParentLocked(tenantID, path)
+	if err != nil {
+		return pathError("mkdir", name, err)
+	}
+	if child := s.meta.DirEntries[parentID][base]; child != 0 && s.activeInodeLocked(child) != nil {
+		return exists("mkdir", name)
+	}
+	now := nowUnix()
+	inode := &inodeRecord{
+		InodeID:             s.nextInodeIDLocked(),
+		TenantID:            tenantID,
+		Kind:                fileKindDir,
+		ParentInode:         parentID,
+		Name:                base,
+		State:               fileStateActive,
+		Mode:                uint32(os.ModeDir | directoryMode(perm)),
+		Generation:          1,
+		MetadataGeneration:  1,
+		NamespaceGeneration: 1,
+		CreatedAt:           now,
+		UpdatedAt:           now,
+		CTime:               now,
+		MTime:               now,
+		ModTime:             now,
+	}
+	return s.commitMetaLocked([]metaOp{
+		{Type: "put_inode", Inode: inode},
+		{Type: "put_dirent", ParentID: parentID, Name: base, ChildID: inode.InodeID},
+	})
 }
 
-// MkdirAll creates a directory and any missing parents.
 func (s *Store) MkdirAll(name string, perm os.FileMode) error {
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return pathError("mkdir", name, err)
 	}
-	if root || path == "" {
+	if root {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	current := ""
+	if err := s.ensureTenantRoot(tenantID); err != nil {
+		return err
+	}
+	if path == "" {
+		return nil
+	}
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	currentID := s.meta.Tenants[tenantID]
+	now := nowUnix()
+	pendingDirs := map[uint64]*inodeRecord{}
+	ops := []metaOp{}
 	for _, part := range strings.Split(path, "/") {
-		if current == "" {
-			current = part
-		} else {
-			current += "/" + part
+		current := s.activeInodeLocked(currentID)
+		if current == nil {
+			current = pendingDirs[currentID]
 		}
-		record := s.activeRecordLocked(tenantID, current)
-		if record == nil {
-			s.createDirLocked(tenantID, current, perm)
+		if current == nil || current.Kind != fileKindDir {
+			return pathError("mkdir", name, ErrNotDir)
+		}
+		childID := s.meta.DirEntries[currentID][part]
+		if childID != 0 {
+			child := s.activeInodeLocked(childID)
+			if child == nil {
+				return pathError("mkdir", name, fs.ErrNotExist)
+			}
+			if child.Kind != fileKindDir {
+				return pathError("mkdir", name, ErrNotDir)
+			}
+			currentID = childID
 			continue
 		}
-		if record.Kind != fileKindDir {
-			return pathError("mkdir", current, ErrNotDir)
+		inode := &inodeRecord{
+			InodeID:             s.nextInodeIDLocked(),
+			TenantID:            tenantID,
+			Kind:                fileKindDir,
+			ParentInode:         currentID,
+			Name:                part,
+			State:               fileStateActive,
+			Mode:                uint32(os.ModeDir | directoryMode(perm)),
+			Generation:          1,
+			MetadataGeneration:  1,
+			NamespaceGeneration: 1,
+			CreatedAt:           now,
+			UpdatedAt:           now,
+			CTime:               now,
+			MTime:               now,
+			ModTime:             now,
 		}
+		pendingDirs[inode.InodeID] = inode
+		ops = append(ops, metaOp{Type: "put_inode", Inode: inode}, metaOp{Type: "put_dirent", ParentID: currentID, Name: part, ChildID: inode.InodeID})
+		currentID = inode.InodeID
 	}
-	return saveMetadata(s.fs, s.metaPath, s.meta)
+	return s.commitMetaLocked(ops)
 }
 
-// Remove removes an empty directory or tombstones a file.
 func (s *Store) Remove(name string) error {
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
@@ -210,42 +250,68 @@ func (s *Store) Remove(name string) error {
 	if root || path == "" {
 		return pathError("remove", name, fs.ErrInvalid)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	record := s.activeRecordLocked(tenantID, path)
-	if record == nil {
-		return notExist("remove", name)
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	inode, err := s.resolvePathLocked(tenantID, path)
+	if err != nil {
+		return pathError("remove", name, err)
 	}
-	if record.Kind == fileKindDir && len(s.activeChildrenLocked(tenantID, path)) > 0 {
+	if inode.Kind == fileKindDir && len(s.meta.DirEntries[inode.InodeID]) > 0 {
 		return pathError("remove", name, ErrNotEmpty)
 	}
-	s.tombstoneRecordLocked(record, nowUnix())
-	return saveMetadata(s.fs, s.metaPath, s.meta)
+	parentID, base, err := s.resolveParentLocked(tenantID, path)
+	if err != nil {
+		return pathError("remove", name, err)
+	}
+	now := nowUnix()
+	next := cloneInode(inode)
+	next.State = fileStateDeleted
+	next.DeletedAt = now
+	next.UpdatedAt = now
+	next.CTime = now
+	next.Generation++
+	ops := []metaOp{{Type: "put_inode", Inode: next}, {Type: "delete_dirent", ParentID: parentID, Name: base}}
+	if inode.Kind == fileKindFile {
+		addDeletedManifestOpsLocked(s.meta, inode.ManifestID, &ops, now)
+	}
+	return s.commitMetaLocked(ops)
 }
 
-// RemoveAll recursively removes files and directory metadata under name.
 func (s *Store) RemoveAll(name string) error {
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return pathError("remove", name, err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := nowUnix()
-	for _, record := range s.meta.Files {
-		if record.State != fileStateActive {
-			continue
-		}
-		if !root && (record.TenantID != tenantID || !pathContains(path, record.Path)) {
-			continue
-		}
-		s.tombstoneRecordLocked(record, now)
+	if root {
+		return pathError("remove", name, fs.ErrInvalid)
 	}
-	rebuildDirEntries(s.meta)
-	return saveMetadata(s.fs, s.metaPath, s.meta)
+	if path == "" {
+		return pathError("remove", name, fs.ErrInvalid)
+	}
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	inode, err := s.resolvePathLocked(tenantID, path)
+	if err != nil {
+		return pathError("remove", name, err)
+	}
+	parentID, base, err := s.resolveParentLocked(tenantID, path)
+	if err != nil {
+		return pathError("remove", name, err)
+	}
+	now := nowUnix()
+	ops := []metaOp{{Type: "delete_dirent", ParentID: parentID, Name: base}}
+	next := cloneInode(inode)
+	next.State = fileStateDeleted
+	next.DeletedAt = now
+	next.UpdatedAt = now
+	next.Generation++
+	ops = append(ops, metaOp{Type: "put_inode", Inode: next})
+	if inode.Kind == fileKindFile {
+		addDeletedManifestOpsLocked(s.meta, inode.ManifestID, &ops, now)
+	}
+	return s.commitMetaLocked(ops)
 }
 
-// Rename moves a file or directory metadata subtree.
 func (s *Store) Rename(oldname, newname string) error {
 	oldTenant, oldPath, oldRoot, err := s.splitVFSPath(oldname)
 	if err != nil {
@@ -261,60 +327,65 @@ func (s *Store) Rename(oldname, newname string) error {
 	if oldTenant != newTenant {
 		return pathError("rename", newname, fs.ErrInvalid)
 	}
-	if oldTenant == newTenant && oldPath != newPath && pathContains(oldPath, newPath) {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	source, err := s.resolvePathLocked(oldTenant, oldPath)
+	if err != nil {
+		return pathError("rename", oldname, err)
+	}
+	oldParentID, oldBase, err := s.resolveParentLocked(oldTenant, oldPath)
+	if err != nil {
+		return pathError("rename", oldname, err)
+	}
+	newParentID, newBase, err := s.resolveParentLocked(newTenant, newPath)
+	if err != nil {
+		return pathError("rename", newname, err)
+	}
+	if oldParentID == newParentID && oldBase == newBase {
+		return nil
+	}
+	if source.Kind == fileKindDir && s.isDescendantLocked(newParentID, source.InodeID) {
 		return pathError("rename", newname, fs.ErrInvalid)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	source := s.activeRecordLocked(oldTenant, oldPath)
-	if source == nil {
-		return notExist("rename", oldname)
-	}
-	if err := s.ensureParentDirLocked("rename", newTenant, newPath); err != nil {
-		return err
-	}
-	target := s.activeRecordLocked(newTenant, newPath)
+	targetID := s.meta.DirEntries[newParentID][newBase]
+	target := s.activeInodeLocked(targetID)
 	now := nowUnix()
+	ops := []metaOp{{Type: "delete_dirent", ParentID: oldParentID, Name: oldBase}}
 	if target != nil {
 		if source.Kind == fileKindDir {
 			if target.Kind != fileKindDir {
 				return pathError("rename", newname, ErrNotDir)
 			}
-			if len(s.activeChildrenLocked(newTenant, newPath)) > 0 {
+			if len(s.meta.DirEntries[target.InodeID]) > 0 {
 				return pathError("rename", newname, ErrNotEmpty)
 			}
 		} else if target.Kind == fileKindDir {
 			return pathError("rename", newname, ErrIsDir)
 		}
-		s.tombstoneRecordLocked(target, now)
-	}
-	moved := map[string]*fileRecord{}
-	for key, record := range s.meta.Files {
-		if record.State != fileStateActive || record.TenantID != oldTenant || !pathContains(oldPath, record.Path) {
-			continue
+		tombstone := cloneInode(target)
+		tombstone.State = fileStateDeleted
+		tombstone.DeletedAt = now
+		tombstone.UpdatedAt = now
+		tombstone.Generation++
+		ops = append(ops, metaOp{Type: "put_inode", Inode: tombstone})
+		if target.Kind == fileKindFile {
+			addDeletedManifestOpsLocked(s.meta, target.ManifestID, &ops, now)
 		}
-		delete(s.meta.Files, key)
-		nextPath := newPath + strings.TrimPrefix(record.Path, oldPath)
-		record.TenantID = newTenant
-		record.Path = strings.TrimPrefix(nextPath, "/")
-		record.ParentPath = parentPath(record.Path)
-		record.Name = pathBase(record.Path)
-		record.Generation++
-		record.MetadataGeneration++
-		record.CTime = now
-		record.MTime = now
-		record.ModTime = now
-		record.UpdatedAt = now
-		moved[fileKey(record.TenantID, record.Path)] = record
 	}
-	for key, record := range moved {
-		s.meta.Files[key] = record
-	}
-	rebuildDirEntries(s.meta)
-	return saveMetadata(s.fs, s.metaPath, s.meta)
+	next := cloneInode(source)
+	next.ParentInode = newParentID
+	next.Name = newBase
+	next.Generation++
+	next.MetadataGeneration++
+	next.NamespaceGeneration++
+	next.CTime = now
+	next.MTime = now
+	next.ModTime = now
+	next.UpdatedAt = now
+	ops = append(ops, metaOp{Type: "put_inode", Inode: next}, metaOp{Type: "put_dirent", ParentID: newParentID, Name: newBase, ChildID: source.InodeID})
+	return s.commitMetaLocked(ops)
 }
 
-// Stat returns filesystem metadata for a BlobFS object or directory.
 func (s *Store) Stat(name string) (os.FileInfo, error) {
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
@@ -326,49 +397,45 @@ func (s *Store) Stat(name string) (os.FileInfo, error) {
 	if path == "" {
 		return blobFileInfo{name: tenantID, mode: os.ModeDir | 0o755, modTime: time.Now(), isDir: true}, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	record := s.activeRecordLocked(tenantID, path)
-	if record == nil {
-		return nil, notExist("stat", name)
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	inode, err := s.resolvePathLocked(tenantID, path)
+	if err != nil {
+		return nil, pathError("stat", name, err)
 	}
-	return fileInfoFromRecord(record), nil
+	return fileInfoFromInode(inode), nil
 }
 
-// Name returns the afero filesystem name.
 func (s *Store) Name() string {
 	return "blobfs"
 }
 
-// Chmod updates the mode stored in file metadata.
 func (s *Store) Chmod(name string, mode os.FileMode) error {
-	return s.updateVFSMetadata("chmod", name, func(record *fileRecord) {
-		if record.Kind == fileKindDir {
-			record.Mode = uint32(os.ModeDir | directoryMode(mode))
+	return s.updateVFSMetadata("chmod", name, func(inode *inodeRecord) {
+		if inode.Kind == fileKindDir {
+			inode.Mode = uint32(os.ModeDir | directoryMode(mode))
 		} else {
-			record.Mode = uint32(s.regularFileMode(mode))
+			inode.Mode = uint32(s.regularFileMode(mode))
 		}
 	})
 }
 
-// Chown updates uid/gid extension metadata.
 func (s *Store) Chown(name string, uid, gid int) error {
-	return s.updateVFSMetadata("chown", name, func(record *fileRecord) {
-		record.UID = uid
-		record.GID = gid
+	return s.updateVFSMetadata("chown", name, func(inode *inodeRecord) {
+		inode.UID = uid
+		inode.GID = gid
 	})
 }
 
-// Chtimes updates modification time extension metadata.
 func (s *Store) Chtimes(name string, _, mtime time.Time) error {
-	return s.updateVFSMetadata("chtimes", name, func(record *fileRecord) {
-		record.ModTime = mtime.UnixNano()
-		record.MTime = record.ModTime
-		record.UpdatedAt = record.ModTime
+	return s.updateVFSMetadata("chtimes", name, func(inode *inodeRecord) {
+		inode.ModTime = mtime.UnixNano()
+		inode.MTime = inode.ModTime
+		inode.UpdatedAt = inode.ModTime
 	})
 }
 
-func (s *Store) updateVFSMetadata(op, name string, edit func(*fileRecord)) error {
+func (s *Store) updateVFSMetadata(op, name string, edit func(*inodeRecord)) error {
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return pathError(op, name, err)
@@ -376,19 +443,20 @@ func (s *Store) updateVFSMetadata(op, name string, edit func(*fileRecord)) error
 	if root || path == "" {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	record := s.activeRecordLocked(tenantID, path)
-	if record == nil {
-		return notExist(op, name)
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	inode, err := s.resolvePathLocked(tenantID, path)
+	if err != nil {
+		return pathError(op, name, err)
 	}
-	edit(record)
+	next := cloneInode(inode)
+	edit(next)
 	now := nowUnix()
-	record.Generation++
-	record.MetadataGeneration++
-	record.CTime = now
-	record.UpdatedAt = now
-	return saveMetadata(s.fs, s.metaPath, s.meta)
+	next.Generation++
+	next.MetadataGeneration++
+	next.CTime = now
+	next.UpdatedAt = now
+	return s.commitMetaLocked([]metaOp{{Type: "put_inode", Inode: next}})
 }
 
 func (s *Store) openDirFile(name, tenantID, path string, root bool) (afero.File, error) {
@@ -399,93 +467,94 @@ func (s *Store) openDirFile(name, tenantID, path string, root bool) (afero.File,
 	} else if path == "" {
 		info.name = tenantID
 	} else {
-		s.mu.Lock()
-		if record := s.activeRecordLocked(tenantID, path); record != nil {
-			info = fileInfoFromRecord(record)
+		s.metaMu.RLock()
+		if inode, err := s.resolvePathLocked(tenantID, path); err == nil {
+			info = fileInfoFromInode(inode)
 		}
-		s.mu.Unlock()
+		s.metaMu.RUnlock()
 	}
 	return &blobVFSFile{name: name, mode: info.mode, modTime: info.modTime, isDir: true, entries: entries}, nil
 }
 
 func (s *Store) listDir(tenantID, path string, root bool) []os.FileInfo {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	seen := map[string]os.FileInfo{}
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	var entries []os.FileInfo
 	if root {
-		for _, record := range s.meta.Files {
-			if record.State == fileStateActive {
-				seen[record.TenantID] = blobFileInfo{name: record.TenantID, mode: os.ModeDir | 0o755, modTime: time.Now(), isDir: true}
-			}
+		names := make([]string, 0, len(s.meta.Tenants))
+		for tenant := range s.meta.Tenants {
+			names = append(names, tenant)
 		}
-	} else {
-		for name, key := range s.meta.DirEntries[dirKey(tenantID, path)] {
-			record := s.meta.Files[key]
-			if record != nil && record.State == fileStateActive {
-				info := fileInfoFromRecord(record)
-				info.name = name
-				seen[name] = info
-			}
+		sort.Strings(names)
+		for _, tenant := range names {
+			entries = append(entries, blobFileInfo{name: tenant, mode: os.ModeDir | 0o755, modTime: time.Now(), isDir: true})
+		}
+		return entries
+	}
+	dir, err := s.resolvePathLocked(tenantID, path)
+	if err != nil || dir.Kind != fileKindDir {
+		return nil
+	}
+	for _, name := range sortedNames(s.meta.DirEntries[dir.InodeID]) {
+		child := s.activeInodeLocked(s.meta.DirEntries[dir.InodeID][name])
+		if child != nil {
+			info := fileInfoFromInode(child)
+			info.name = name
+			entries = append(entries, info)
 		}
 	}
-	entries := make([]os.FileInfo, 0, len(seen))
-	for _, info := range seen {
-		entries = append(entries, info)
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
 	return entries
 }
 
-func (s *Store) activeRecordLocked(tenantID, path string) *fileRecord {
-	record := s.meta.Files[fileKey(tenantID, path)]
-	if record == nil || record.State != fileStateActive {
-		return nil
+func (s *Store) isDescendantLocked(nodeID, ancestorID uint64) bool {
+	for nodeID != 0 {
+		if nodeID == ancestorID {
+			return true
+		}
+		inode := s.meta.Inodes[nodeID]
+		if inode == nil {
+			return false
+		}
+		nodeID = inode.ParentInode
 	}
-	return record
-}
-
-func (s *Store) createDirLocked(tenantID, path string, perm os.FileMode) {
-	now := nowUnix()
-	record := s.newFileRecordLocked(tenantID, path, fileKindDir, now)
-	record.Mode = uint32(os.ModeDir | directoryMode(perm))
-	record.ModTime = now
-	record.Size = 0
-	s.meta.Files[fileKey(tenantID, path)] = record
-	s.addDirEntryLocked(record)
-}
-
-func (s *Store) tombstoneRecordLocked(record *fileRecord, now int64) {
-	record.State = fileStateDeleted
-	record.DeletedAt = now
-	record.UpdatedAt = now
-	record.CTime = now
-	record.Generation++
-	s.removeDirEntryLocked(record)
-	if record.Kind == fileKindFile {
-		s.markManifestDeletedIfUnreferencedLocked(record.ManifestID, now)
-	}
+	return false
 }
 
 func (s *Store) createWriteSession() (afero.File, string, error) {
+	s.writeSessionMu.Lock()
+	if s.openWriteSessions >= s.cfg.MaxOpenWriteSessions {
+		s.writeSessionMu.Unlock()
+		return nil, "", ErrTooManyOpenWriteSessions
+	}
+	s.openWriteSessions++
+	s.writeSessionMu.Unlock()
+	created := false
+	defer func() {
+		if !created {
+			s.writeSessionMu.Lock()
+			s.openWriteSessions--
+			s.writeSessionMu.Unlock()
+		}
+	}()
 	for i := 0; i < 100; i++ {
-		name := filepath.Join(s.sessionsDir, fmt.Sprintf("session-%d-%d.tmp", nowUnix(), i))
+		name := filepath.Join(s.stagingDir, "sessions", "session-"+fmtTime()+"-"+strconv.Itoa(i)+".tmp")
+		if err := s.fs.MkdirAll(filepath.Dir(name), 0o700); err != nil {
+			return nil, "", err
+		}
 		file, err := s.fs.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 		if os.IsExist(err) {
 			continue
+		}
+		if err == nil {
+			created = true
 		}
 		return file, name, err
 	}
 	return nil, "", errors.New("create write session: exhausted name attempts")
 }
 
-func (s *Store) releaseWriteSession() {
-	s.mu.Lock()
-	if s.openWriteSessions > 0 {
-		s.openWriteSessions--
-	}
-	s.mu.Unlock()
+func fmtTime() string {
+	return strconv.FormatInt(nowUnix(), 10)
 }
 
 func (s *Store) regularFileMode(mode os.FileMode) os.FileMode {
@@ -542,13 +611,29 @@ func (s *Store) splitVFSPath(name string) (tenantID, path string, root bool, err
 	return tenantID, path, false, nil
 }
 
-func parentPath(path string) string {
-	if i := strings.LastIndex(path, "/"); i >= 0 {
-		return path[:i]
-	}
-	return ""
+type vfsNodeInfo struct {
+	exists     bool
+	isDir      bool
+	generation uint64
+	mode       os.FileMode
+	modTime    time.Time
+	options    map[string]string
 }
 
-func pathContains(parent, child string) bool {
-	return parent == "" || child == parent || strings.HasPrefix(child, parent+"/")
+func (s *Store) vfsNodeInfo(tenantID, path string) (vfsNodeInfo, error) {
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	inode, err := s.resolvePathLocked(tenantID, path)
+	if err != nil {
+		return vfsNodeInfo{}, err
+	}
+	info := fileInfoFromInode(inode)
+	return vfsNodeInfo{
+		exists:     true,
+		isDir:      inode.Kind == fileKindDir,
+		generation: inode.Generation,
+		mode:       info.mode,
+		modTime:    info.modTime,
+		options:    copyOptions(inode.Options),
+	}, nil
 }

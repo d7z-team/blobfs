@@ -1,17 +1,19 @@
 package blobfs
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
 )
 
 var (
-	ErrNotEmpty = errors.New("directory not empty")
-	ErrIsDir    = errors.New("is a directory")
-	ErrNotDir   = errors.New("not a directory")
-	ErrConflict = errors.New("file changed while handle was open")
-	ErrTooLarge = errors.New("file too large")
+	ErrNotEmpty                 = errors.New("directory not empty")
+	ErrIsDir                    = errors.New("is a directory")
+	ErrNotDir                   = errors.New("not a directory")
+	ErrConflict                 = errors.New("file changed while handle was open")
+	ErrTooLarge                 = errors.New("file too large")
+	ErrTooManyOpenWriteSessions = errors.New("too many open write sessions")
 )
 
 func pathError(op, path string, err error) error {
@@ -28,4 +30,11 @@ func exists(op, path string) error {
 
 func invalidPath(op, path string) error {
 	return pathError(op, path, fs.ErrInvalid)
+}
+
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("context is nil")
+	}
+	return ctx.Err()
 }

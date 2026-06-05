@@ -6,16 +6,27 @@ import (
 	"time"
 )
 
-// RunGC performs one mark/sweep pass and optionally compacts eligible segments.
+type compactCandidate struct {
+	Source segmentRecord
+	Chunks []chunkRecord
+}
+
+type compactResult struct {
+	Source   segmentRecord
+	Segments []*segmentRecord
+	Original []chunkRecord
+	Moved    []chunkRecord
+}
+
+// RunGC marks unreferenced chunks, optionally compacts fragmented segments, and
+// deletes fully dead segments without holding metadata locks during filesystem IO.
 func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
-	if err := ctx.Err(); err != nil {
+	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	nowTime := time.Now()
 	now := nowTime.UnixNano()
+	segmentDeleteCutoff := now - int64(s.cfg.GC.SegmentDeleteDelay)
 	safetyWindow := s.cfg.GC.SafetyWindow
 	if opts.SafetyWindow != 0 {
 		safetyWindow = opts.SafetyWindow
@@ -30,237 +41,385 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 	if confirmCycles < 1 {
 		confirmCycles = 1
 	}
+
+	result := &GCResult{}
+	var removeSegments []segmentRecord
+	var compactCandidates []compactCandidate
+
+	s.metaMu.Lock()
 	epoch := s.meta.NextGCEpoch
 	s.meta.NextGCEpoch++
-	result := &GCResult{Epoch: epoch}
-	cutoff := nowTime.Add(-safetyWindow).UnixNano()
-	s.meta.GCRuns = append(s.meta.GCRuns, gcRun{
-		Epoch:        epoch,
-		State:        "RUNNING",
-		StartedAt:    now,
-		SafetyCutoff: cutoff,
-	})
-
-	liveManifests := map[string]bool{}
-	for _, file := range s.meta.Files {
-		if file.State == fileStateActive {
-			liveManifests[file.ManifestID] = true
-		}
-	}
-	liveChunks := map[string]bool{}
-	for manifestID := range liveManifests {
-		manifest := s.meta.Manifests[manifestID]
-		if manifest == nil {
-			continue
-		}
-		manifest.State = manifestStateActive
-		manifest.DeletedAt = 0
-		manifest.LastLiveAt = now
-		for _, ref := range s.manifestRefs(manifest) {
-			liveChunks[ref.ChunkID] = true
-		}
-	}
-	for id, manifest := range s.meta.Manifests {
-		if !liveManifests[id] && manifest.State == manifestStateActive {
-			manifest.State = manifestStateDeleted
-			manifest.DeletedAt = now
-			result.ManifestsReclaimed++
-		}
-	}
-	for id := range liveChunks {
-		chunk := s.meta.Chunks[id]
-		if chunk == nil {
-			continue
-		}
-		chunk.LastLiveEpoch = epoch
-		chunk.LastSeenAt = now
-		if chunk.State == chunkStateGarbageCandidate || chunk.State == chunkStateDeleting {
-			chunk.State = chunkStateActive
-			chunk.GarbageSeenCount = 0
-			chunk.GarbageCandidateAt = 0
-			chunk.DeletingAt = 0
-		}
-		result.LiveChunks++
+	result.Epoch = epoch
+	ops := []metaOp{{Type: "append_gcrun", GCRun: &gcRun{Epoch: epoch, State: "DONE", StartedAt: now, FinishedAt: now, SafetyCutoff: nowTime.Add(-safetyWindow).UnixNano()}}}
+	s.collectUnreachableInodesLocked(now, &ops)
+	if err := s.commitMetaLocked(ops); err != nil {
+		s.metaMu.Unlock()
+		return nil, err
 	}
 
+	ops = ops[:0]
+	s.markUnreferencedChunksLocked(now, nowTime.Add(-safetyWindow).UnixNano(), confirmCycles, result, &ops)
+	if err := s.commitMetaLocked(ops); err != nil {
+		s.metaMu.Unlock()
+		return nil, err
+	}
+
+	if opts.Compact {
+		compactCandidates = s.collectCompactCandidatesLocked()
+		ops = ops[:0]
+		for _, candidate := range compactCandidates {
+			next := candidate.Source
+			next.State = segmentStateCompacting
+			ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
+		}
+		if err := s.commitMetaLocked(ops); err != nil {
+			s.metaMu.Unlock()
+			return nil, err
+		}
+	} else {
+		removeSegments = s.collectDeadSegmentsLocked(segmentDeleteCutoff)
+	}
+	s.metaMu.Unlock()
+
+	if len(compactCandidates) > 0 {
+		compacted, err := s.compactCandidates(ctx, compactCandidates)
+		if err != nil {
+			s.rollbackCompaction(compactCandidates)
+			return result, err
+		}
+		deleted, err := s.commitCompactionResults(compacted, result, now, segmentDeleteCutoff)
+		if err != nil {
+			for _, item := range compacted {
+				for _, seg := range item.Segments {
+					_ = s.fs.Remove(s.segmentPath(seg))
+				}
+			}
+			s.rollbackCompaction(compactCandidates)
+			return result, err
+		}
+		removeSegments = append(removeSegments, deleted...)
+		s.metaMu.RLock()
+		removeSegments = append(removeSegments, s.collectDeadSegmentsLocked(segmentDeleteCutoff)...)
+		s.metaMu.RUnlock()
+	}
+
+	deleted, err := s.removeSegmentFiles(ctx, removeSegments)
+	if err != nil || len(deleted) == 0 {
+		return result, err
+	}
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	ops = ops[:0]
+	for _, seg := range deleted {
+		if current := s.meta.Segments[seg.SegmentID]; current != nil && current.State != segmentStateDeleted && s.segmentReadyForRemovalLocked(current, segmentDeleteCutoff) {
+			next := *current
+			next.State = segmentStateDeleted
+			next.DeletedAt = now
+			ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
+			result.SegmentsDeleted++
+		}
+	}
+	return result, s.commitMetaLocked(ops)
+}
+
+func (s *Store) markUnreferencedChunksLocked(now, cutoff int64, confirmCycles int, result *GCResult, ops *[]metaOp) {
 	for _, chunk := range s.meta.Chunks {
-		if liveChunks[chunk.ChunkID] || chunk.State == chunkStateDeleted {
+		if chunk.State == chunkStateDeleted || chunk.RefCount > 0 || chunk.CreatedAt >= cutoff {
+			if chunk.RefCount > 0 {
+				result.LiveChunks++
+			}
 			continue
 		}
-		if chunk.CreatedAt >= cutoff {
-			continue
-		}
+		next := *chunk
 		switch chunk.State {
-		case chunkStateWriting:
-			chunk.State = chunkStateDeleted
-			chunk.DeletedAt = now
-			result.ChunksDeleted++
 		case chunkStateActive:
-			chunk.State = chunkStateGarbageCandidate
-			chunk.GarbageSeenCount = 1
-			chunk.GarbageCandidateAt = now
-			result.CandidatesMarked++
-		case chunkStateGarbageCandidate:
-			if chunk.GarbageSeenCount+1 >= confirmCycles {
-				chunk.State = chunkStateDeleting
-				chunk.DeletingAt = now
-				result.ChunksDeleting++
+			if confirmCycles <= 1 {
+				next.State = chunkStateDeleted
+				next.DeletedAt = now
+				result.ChunksDeleted++
 				result.BytesMadeGarbage += chunk.StoredSize
 			} else {
-				chunk.GarbageSeenCount++
+				next.State = chunkStateGarbageCandidate
+				next.GarbageSeenCount = 1
+				next.GarbageCandidateAt = now
+				result.CandidatesMarked++
+			}
+		case chunkStateGarbageCandidate:
+			if chunk.GarbageSeenCount+1 >= confirmCycles {
+				next.State = chunkStateDeleted
+				next.DeletedAt = now
+				result.ChunksDeleted++
+				result.BytesMadeGarbage += chunk.StoredSize
+			} else {
+				next.GarbageSeenCount++
 				result.CandidatesMarked++
 			}
 		}
+		*ops = append(*ops, metaOp{Type: "put_chunk", Chunk: &next})
 	}
+}
 
-	s.recomputeSegmentEstimatesLocked()
-	if opts.Compact {
-		if err := s.compactEligibleSegmentsLocked(ctx, now, result); err != nil {
+func (s *Store) collectCompactCandidatesLocked() []compactCandidate {
+	var candidates []compactCandidate
+	for _, seg := range s.meta.Segments {
+		if seg.State != segmentStateSealed || s.segmentPinned(seg.SegmentID) {
+			continue
+		}
+		var liveBytes, garbageBytes int64
+		var liveChunks []chunkRecord
+		for _, chunk := range s.meta.Chunks {
+			if chunk.SegmentID != seg.SegmentID {
+				continue
+			}
+			if chunk.State == chunkStateDeleted || chunk.RefCount == 0 {
+				garbageBytes += chunk.SegmentLength
+				continue
+			}
+			liveBytes += chunk.SegmentLength
+			liveChunks = append(liveChunks, *chunk)
+		}
+		total := liveBytes + garbageBytes
+		if liveBytes == 0 || garbageBytes == 0 || total == 0 {
+			continue
+		}
+		if float64(garbageBytes)/float64(total) >= s.cfg.GC.CompactGarbageRatio {
+			candidates = append(candidates, compactCandidate{Source: *seg, Chunks: liveChunks})
+		}
+	}
+	return candidates
+}
+
+func (s *Store) compactCandidates(ctx context.Context, candidates []compactCandidate) ([]compactResult, error) {
+	results := make([]compactResult, 0, len(candidates))
+	for _, candidate := range candidates {
+		if err := contextError(ctx); err != nil {
+			s.removeCompactedSegments(results)
 			return nil, err
 		}
+		writer := &segmentBatchWriter{store: s}
+		result := compactResult{Source: candidate.Source}
+		for _, chunk := range candidate.Chunks {
+			raw, err := s.readChunkPayloadAt(candidate.Source, chunk)
+			if err != nil {
+				writer.cleanup()
+				s.removeCompactedSegments(results)
+				return nil, err
+			}
+			next, err := writer.appendChunk(chunk.TenantID, chunk.ChunkID, raw)
+			if err != nil {
+				writer.cleanup()
+				s.removeCompactedSegments(results)
+				return nil, err
+			}
+			next.RefCount = chunk.RefCount
+			result.Original = append(result.Original, chunk)
+			result.Moved = append(result.Moved, next)
+		}
+		if err := writer.finish(); err != nil {
+			writer.cleanup()
+			s.removeCompactedSegments(results)
+			return nil, err
+		}
+		result.Segments = writer.segments
+		results = append(results, result)
 	}
-	if err := s.deleteCompactedSegmentsLocked(now, result); err != nil {
-		return nil, err
-	}
-	s.finishGCRunLocked(epoch, now, "DONE")
-	if err := saveMetadata(s.fs, s.metaPath, s.meta); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return results, nil
 }
 
-func (s *Store) recomputeSegmentEstimatesLocked() {
-	for _, seg := range s.meta.Segments {
-		seg.LiveBytesEstimate = 0
-		seg.GarbageBytesEstimate = 0
-	}
-	for _, chunk := range s.meta.Chunks {
-		seg := s.meta.Segments[chunk.SegmentID]
-		if seg == nil {
-			continue
-		}
-		switch chunk.State {
-		case chunkStateDeleting, chunkStateDeleted:
-			seg.GarbageBytesEstimate += chunk.SegmentLength
-		default:
-			seg.LiveBytesEstimate += chunk.SegmentLength
+func (s *Store) removeCompactedSegments(results []compactResult) {
+	for _, item := range results {
+		for _, seg := range item.Segments {
+			_ = s.fs.Remove(s.segmentPath(seg))
 		}
 	}
 }
 
-func (s *Store) compactEligibleSegmentsLocked(ctx context.Context, now int64, result *GCResult) error {
-	segments := make([]*segmentRecord, 0, len(s.meta.Segments))
+func (s *Store) commitCompactionResults(results []compactResult, gcResult *GCResult, now, segmentDeleteCutoff int64) ([]segmentRecord, error) {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	var deleteSegments []segmentRecord
+	ops := []metaOp{}
+	for _, item := range results {
+		source := s.meta.Segments[item.Source.SegmentID]
+		if source == nil || source.State != segmentStateCompacting {
+			continue
+		}
+		if len(item.Original) != len(item.Moved) {
+			for _, seg := range item.Segments {
+				deleteSegments = append(deleteSegments, *seg)
+			}
+			continue
+		}
+		var chunkUpdates []chunkRecord
+		valid := true
+		for i, moved := range item.Moved {
+			original := item.Original[i]
+			current := s.meta.Chunks[moved.ChunkID]
+			if current == nil ||
+				current.SegmentID != item.Source.SegmentID ||
+				current.SegmentOffset != original.SegmentOffset ||
+				current.SegmentLength != original.SegmentLength ||
+				current.State == chunkStateDeleted ||
+				current.RefCount == 0 {
+				valid = false
+				break
+			}
+			next := *current
+			next.SegmentID = moved.SegmentID
+			next.SegmentOffset = moved.SegmentOffset
+			next.SegmentLength = moved.SegmentLength
+			next.StoredSize = moved.StoredSize
+			next.ChecksumCRC32C = moved.ChecksumCRC32C
+			next.Compression = moved.Compression
+			chunkUpdates = append(chunkUpdates, next)
+		}
+		if !valid {
+			rollback := *source
+			rollback.State = segmentStateSealed
+			ops = append(ops, metaOp{Type: "put_segment", Segment: &rollback})
+			for _, seg := range item.Segments {
+				deleteSegments = append(deleteSegments, *seg)
+			}
+			continue
+		}
+		for _, seg := range item.Segments {
+			next := *seg
+			ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
+		}
+		for _, chunk := range chunkUpdates {
+			next := chunk
+			ops = append(ops, metaOp{Type: "put_chunk", Chunk: &next})
+			gcResult.BytesRewritten += next.StoredSize
+		}
+		nextSource := *source
+		nextSource.State = segmentStateSealed
+		nextSource.CompactedAt = now
+		if !s.segmentPinned(source.SegmentID) && nextSource.CompactedAt <= segmentDeleteCutoff {
+			deleteSegments = append(deleteSegments, *source)
+		}
+		ops = append(ops, metaOp{Type: "put_segment", Segment: &nextSource})
+		gcResult.SegmentsCompacted++
+	}
+	return deleteSegments, s.commitMetaLocked(ops)
+}
+
+func (s *Store) rollbackCompaction(candidates []compactCandidate) {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	ops := []metaOp{}
+	for _, candidate := range candidates {
+		seg := s.meta.Segments[candidate.Source.SegmentID]
+		if seg == nil || seg.State != segmentStateCompacting {
+			continue
+		}
+		next := *seg
+		next.State = segmentStateSealed
+		ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
+	}
+	_ = s.commitMetaLocked(ops)
+}
+
+func (s *Store) collectDeadSegmentsLocked(segmentDeleteCutoff int64) []segmentRecord {
+	var segments []segmentRecord
 	for _, seg := range s.meta.Segments {
-		if seg.State == segmentStateDeleted || seg.State == segmentStateCorrupt || seg.State == segmentStateCompacted || seg.State == segmentStateCompacting {
+		if seg.State == segmentStateDeleted || seg.State == segmentStateCorrupt || s.segmentPinned(seg.SegmentID) {
 			continue
 		}
-		if seg.GarbageBytesEstimate <= 0 || seg.TotalBytes <= 0 {
-			continue
-		}
-		if float64(seg.GarbageBytesEstimate)/float64(seg.TotalBytes) >= s.cfg.GC.CompactGarbageRatio {
-			segments = append(segments, seg)
+		if s.segmentReadyForRemovalLocked(seg, segmentDeleteCutoff) {
+			segments = append(segments, *seg)
 		}
 	}
+	return segments
+}
+
+func (s *Store) removeSegmentFiles(ctx context.Context, segments []segmentRecord) ([]segmentRecord, error) {
+	var deleted []segmentRecord
+	seen := map[string]bool{}
 	for _, seg := range segments {
-		if err := ctx.Err(); err != nil {
-			return err
+		if seen[seg.SegmentID] {
+			continue
 		}
-		if err := s.compactSegmentLocked(seg, now, result); err != nil {
-			return err
+		seen[seg.SegmentID] = true
+		if err := contextError(ctx); err != nil {
+			return deleted, err
 		}
+		if err := s.fs.Remove(s.segmentPath(&seg)); err != nil && !os.IsNotExist(err) {
+			return deleted, err
+		}
+		deleted = append(deleted, seg)
 	}
-	return nil
+	return deleted, nil
 }
 
-func (s *Store) compactSegmentLocked(sourceSeg *segmentRecord, now int64, result *GCResult) error {
-	sourceSeg.State = segmentStateCompacting
-	copiedSegmentIDs := map[string]bool{}
+func (s *Store) segmentHasLiveChunksLocked(segmentID string) bool {
 	for _, chunk := range s.meta.Chunks {
-		if chunk.SegmentID != sourceSeg.SegmentID {
-			continue
-		}
-		if chunk.State == chunkStateDeleting || chunk.State == chunkStateDeleted {
-			continue
-		}
-		sourceLocation := *chunk
-		raw, err := s.readChunkPayloadAt(*sourceSeg, sourceLocation)
-		if err != nil {
-			sourceSeg.State = segmentStateSealed
-			return err
-		}
-		loc, err := s.appendChunkRecordLocked(chunk.ChunkID, raw)
-		if err != nil {
-			sourceSeg.State = segmentStateSealed
-			return err
-		}
-		current := s.meta.Chunks[chunk.ChunkID]
-		if current != nil &&
-			current.SegmentID == sourceLocation.SegmentID &&
-			current.SegmentOffset == sourceLocation.SegmentOffset &&
-			current.SegmentLength == sourceLocation.SegmentLength {
-			current.SegmentID = loc.SegmentID
-			current.SegmentOffset = loc.SegmentOffset
-			current.SegmentLength = loc.SegmentLength
-			current.StoredSize = loc.StoredSize
-			current.ChecksumCRC32C = loc.Checksum
-			current.Compression = loc.Compression
-			copiedSegmentIDs[loc.SegmentID] = true
-			result.BytesRewritten += loc.StoredSize
+		if chunk.SegmentID == segmentID && chunk.State != chunkStateDeleted {
+			return true
 		}
 	}
+	return false
+}
+
+func (s *Store) segmentReadyForRemovalLocked(seg *segmentRecord, segmentDeleteCutoff int64) bool {
+	if s.segmentHasLiveChunksLocked(seg.SegmentID) {
+		return false
+	}
+	deadAt := seg.CompactedAt
 	for _, chunk := range s.meta.Chunks {
-		if chunk.SegmentID == sourceSeg.SegmentID && (chunk.State == chunkStateDeleting || chunk.State == chunkStateDeleted) {
-			chunk.State = chunkStateDeleted
-			if chunk.DeletedAt == 0 {
-				chunk.DeletedAt = now
-				result.ChunksDeleted++
+		if chunk.SegmentID != seg.SegmentID {
+			continue
+		}
+		if chunk.DeletedAt == 0 {
+			return false
+		}
+		if chunk.DeletedAt > deadAt {
+			deadAt = chunk.DeletedAt
+		}
+	}
+	if deadAt == 0 {
+		deadAt = seg.SealedAt
+	}
+	if deadAt == 0 {
+		deadAt = seg.CreatedAt
+	}
+	return deadAt <= segmentDeleteCutoff
+}
+
+func (s *Store) collectUnreachableInodesLocked(now int64, ops *[]metaOp) {
+	reachable := map[uint64]bool{}
+	for _, rootID := range s.meta.Tenants {
+		s.markReachableLocked(rootID, reachable)
+	}
+	manifestRecords := map[string]*manifestRecord{}
+	manifestDeltas := map[string]int{}
+	chunkDeltas := map[string]int{}
+	for _, inode := range s.meta.Inodes {
+		if inode.State != fileStateActive || reachable[inode.InodeID] {
+			continue
+		}
+		next := cloneInode(inode)
+		next.State = fileStateDeleted
+		next.DeletedAt = now
+		next.UpdatedAt = now
+		next.Generation++
+		*ops = append(*ops, metaOp{Type: "put_inode", Inode: next})
+		if inode.Kind == fileKindFile {
+			if manifest := s.meta.Manifests[inode.ManifestID]; manifest != nil {
+				manifestRecords[manifest.ManifestID] = manifest
+				addManifestRefDelta(manifest, -1, manifestDeltas, chunkDeltas)
 			}
 		}
 	}
-	for id := range copiedSegmentIDs {
-		if seg := s.meta.Segments[id]; seg != nil && seg.State == segmentStateOpen {
-			seg.State = segmentStateSealed
-			seg.SealedAt = now
-		}
-	}
-	sourceSeg.State = segmentStateCompacted
-	sourceSeg.CompactedAt = now
-	result.SegmentsCompacted++
-	s.recomputeSegmentEstimatesLocked()
-	return nil
+	appendRefDeltaOpsLocked(s.meta, ops, manifestRecords, manifestDeltas, chunkDeltas, now)
 }
 
-func (s *Store) deleteCompactedSegmentsLocked(now int64, result *GCResult) error {
-	delay := s.cfg.GC.SegmentDeleteDelay
-	if delay < 0 {
-		delay = 0
+func (s *Store) markReachableLocked(inodeID uint64, reachable map[uint64]bool) {
+	inode := s.activeInodeLocked(inodeID)
+	if inode == nil || reachable[inodeID] {
+		return
 	}
-	for _, seg := range s.meta.Segments {
-		if seg.State != segmentStateCompacted || seg.CompactedAt == 0 {
-			continue
-		}
-		if time.Duration(now-seg.CompactedAt) < delay {
-			continue
-		}
-		if s.segmentPinned(seg.SegmentID) {
-			continue
-		}
-		if err := s.fs.Remove(s.segmentPath(seg)); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		seg.State = segmentStateDeleted
-		seg.DeletedAt = now
-		result.SegmentsDeleted++
-	}
-	return nil
-}
-
-func (s *Store) finishGCRunLocked(epoch, now int64, state string) {
-	for i := len(s.meta.GCRuns) - 1; i >= 0; i-- {
-		if s.meta.GCRuns[i].Epoch == epoch {
-			s.meta.GCRuns[i].State = state
-			s.meta.GCRuns[i].FinishedAt = now
-			return
-		}
+	reachable[inodeID] = true
+	for _, childID := range s.meta.DirEntries[inodeID] {
+		s.markReachableLocked(childID, reachable)
 	}
 }

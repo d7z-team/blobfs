@@ -30,9 +30,8 @@ const (
 	DedupScopeGlobal DedupScope = "global"
 )
 
-// Config controls file classification, chunking, segment layout, and GC behavior.
+// Config controls chunking, segment layout, VFS write sessions, and GC behavior.
 type Config struct {
-	LargeFileThreshold   int64
 	SegmentSize          int64
 	MaxFileSize          int64
 	MaxTenantLength      int
@@ -72,16 +71,14 @@ type GCOptions struct {
 
 // GCResult reports work completed by a GC run.
 type GCResult struct {
-	Epoch              int64
-	LiveChunks         int
-	CandidatesMarked   int
-	ChunksDeleting     int
-	ChunksDeleted      int
-	SegmentsCompacted  int
-	SegmentsDeleted    int
-	BytesRewritten     int64
-	BytesMadeGarbage   int64
-	ManifestsReclaimed int
+	Epoch             int64
+	LiveChunks        int
+	CandidatesMarked  int
+	ChunksDeleted     int
+	SegmentsCompacted int
+	SegmentsDeleted   int
+	BytesRewritten    int64
+	BytesMadeGarbage  int64
 }
 
 // ScrubOptions controls full-store corruption checks.
@@ -127,7 +124,6 @@ type ScrubResult struct {
 // DefaultConfig returns production-oriented defaults for CAS chunk storage.
 func DefaultConfig() Config {
 	return Config{
-		LargeFileThreshold:   64 << 20,
 		SegmentSize:          256 << 20,
 		MaxFileSize:          1 << 40,
 		MaxTenantLength:      128,
@@ -155,9 +151,6 @@ func DefaultConfig() Config {
 func normalizeConfig(cfg Config) Config {
 	def := DefaultConfig()
 	emptyGC := cfg.GC == GCConfig{}
-	if cfg.LargeFileThreshold == 0 {
-		cfg.LargeFileThreshold = def.LargeFileThreshold
-	}
 	if cfg.SegmentSize == 0 {
 		cfg.SegmentSize = def.SegmentSize
 	}
@@ -222,9 +215,6 @@ func validateConfig(cfg Config) error {
 	}
 	if !strings.EqualFold(cfg.Chunking.Algorithm, "FastCDC") {
 		return fmt.Errorf("unsupported chunking algorithm %q", cfg.Chunking.Algorithm)
-	}
-	if cfg.LargeFileThreshold < 0 {
-		return errors.New("large file threshold must be non-negative")
 	}
 	if cfg.SegmentSize <= 0 {
 		return errors.New("segment size must be positive")

@@ -24,40 +24,6 @@ func hashBytes(tenantID string, scoped bool, data []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func splitFastCDC(data []byte, cfg ChunkingConfig) []chunkSlice {
-	if len(data) == 0 {
-		return []chunkSlice{{Offset: 0, Size: 0}}
-	}
-	if cfg.MinSize <= 0 || cfg.AvgSize <= 0 || cfg.MaxSize <= 0 || cfg.MinSize > cfg.AvgSize || cfg.AvgSize > cfg.MaxSize {
-		cfg = DefaultConfig().Chunking
-	}
-	mask := uint64(nextPowerOfTwo(cfg.AvgSize) - 1)
-	var result []chunkSlice
-	for start := 0; start < len(data); {
-		if len(data)-start <= cfg.MaxSize {
-			result = append(result, chunkSlice{Offset: int64(start), Size: int64(len(data) - start)})
-			break
-		}
-		minEnd := start + cfg.MinSize
-		maxEnd := start + cfg.MaxSize
-		if maxEnd > len(data) {
-			maxEnd = len(data)
-		}
-		fp := uint64(0)
-		cut := maxEnd
-		for i := start; i < maxEnd; i++ {
-			fp = (fp << 1) + gearTable[data[i]]
-			if i+1 >= minEnd && (fp&mask) == 0 {
-				cut = i + 1
-				break
-			}
-		}
-		result = append(result, chunkSlice{Offset: int64(start), Size: int64(cut - start)})
-		start = cut
-	}
-	return result
-}
-
 func nextPowerOfTwo(v int) int {
 	p := 1
 	for p < v {
@@ -99,9 +65,4 @@ func manifestID(tenantID, fileHash string, fileSize int64, chunkingType string, 
 		h.Write(buf[:])
 	}
 	return hex.EncodeToString(h.Sum(nil))
-}
-
-type chunkSlice struct {
-	Offset int64
-	Size   int64
 }

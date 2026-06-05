@@ -47,7 +47,9 @@ func (f *blobVFSFile) Close() error {
 		}
 		if f.store != nil && f.sessionName != "" {
 			_ = f.store.fs.Remove(f.sessionName)
-			f.store.releaseWriteSession()
+			f.store.writeSessionMu.Lock()
+			f.store.openWriteSessions--
+			f.store.writeSessionMu.Unlock()
 		}
 		f.session = nil
 	}
@@ -224,48 +226,19 @@ func (f *blobVFSFile) Sync() error {
 	if _, err := f.session.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	data, err := readInput(context.Background(), io.LimitReader(f.session, f.size), f.store.cfg.MaxFileSize)
-	if err != nil {
-		return err
-	}
-	scopeID := f.store.dedupScopeID(f.tenantID)
-	fileHash := hashBytes(scopeID, scopeID != "", data)
-	now := nowUnix()
-
-	f.store.mu.Lock()
-	defer f.store.mu.Unlock()
-	manifest := f.store.findReusableManifestLocked(scopeID, fileHash, int64(len(data)))
-	if manifest == nil {
-		manifest, err = f.store.ingestManifestLocked(scopeID, fileHash, data, now)
-		if err != nil {
-			return err
-		}
-	}
-	manifest.State = manifestStateActive
-	manifest.DeletedAt = 0
-	manifest.LastLiveAt = now
-	record, err := f.store.commitFileRecordLocked(commitFileOptions{
-		Op:              "sync",
-		TenantID:        f.tenantID,
-		Path:            f.path,
-		Size:            int64(len(data)),
-		FileHash:        fileHash,
-		ManifestID:      manifest.ManifestID,
-		Options:         copyOptions(f.options),
-		Mode:            f.mode,
-		ModTime:         f.modTime.UnixNano(),
-		Now:             now,
-		BaseGeneration:  f.baseGeneration,
-		CheckGeneration: true,
+	limit := io.LimitReader(f.session, f.size)
+	result, err := f.store.putObject(context.Background(), f.tenantID, f.path, limit, putCommitOptions{
+		baseGeneration:  f.baseGeneration,
+		checkGeneration: true,
+		mode:            f.mode,
+		modTime:         f.modTime.UnixNano(),
+		options:         copyOptions(f.options),
 	})
 	if err != nil {
 		return err
 	}
-	if err = saveMetadata(f.store.fs, f.store.metaPath, f.store.meta); err != nil {
-		return err
-	}
-	f.baseGeneration = record.Generation
-	f.size = int64(len(data))
+	f.baseGeneration = result.Generation
+	f.size = result.Size
 	f.dirty = false
 	return nil
 }
@@ -311,29 +284,29 @@ type blobFileInfo struct {
 	isDir   bool
 }
 
-func fileInfoFromRecord(record *fileRecord) blobFileInfo {
-	mode := os.FileMode(record.Mode)
+func fileInfoFromInode(inode *inodeRecord) blobFileInfo {
+	mode := os.FileMode(inode.Mode)
 	if mode == 0 {
-		if record.Kind == fileKindDir {
+		if inode.Kind == fileKindDir {
 			mode = os.ModeDir | 0o755
 		} else {
 			mode = defaultVFSMode
 		}
 	}
-	isDir := record.Kind == fileKindDir
+	isDir := inode.Kind == fileKindDir
 	if isDir {
 		mode |= os.ModeDir
 	}
-	modTime := time.Unix(0, record.MTime)
-	if record.MTime == 0 {
-		modTime = time.Unix(0, record.ModTime)
+	modTime := time.Unix(0, inode.MTime)
+	if inode.MTime == 0 {
+		modTime = time.Unix(0, inode.ModTime)
 	}
-	if record.ModTime == 0 && record.MTime == 0 {
-		modTime = time.Unix(0, record.UpdatedAt)
+	if inode.ModTime == 0 && inode.MTime == 0 {
+		modTime = time.Unix(0, inode.UpdatedAt)
 	}
 	return blobFileInfo{
-		name:    filepath.Base(record.Path),
-		size:    record.Size,
+		name:    inode.Name,
+		size:    inode.Size,
 		mode:    mode,
 		modTime: modTime,
 		isDir:   isDir,
