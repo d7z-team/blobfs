@@ -26,8 +26,8 @@ func testConfig() Config {
 		AvgSize:   16,
 		MaxSize:   24,
 	}
-	cfg.GC.SafetyWindow = 0
-	cfg.GC.SegmentDeleteDelay = 0
+	cfg.GC.SafetyWindow = -1
+	cfg.GC.SegmentDeleteDelay = -1
 	cfg.GC.CandidateConfirmCycles = 1
 	cfg.GC.CompactGarbageRatio = 0.25
 	return cfg
@@ -77,6 +77,16 @@ func readTestBytes(t *testing.T, store *Store, tenantID, path string) []byte {
 
 func firstChunkPayload(t *testing.T, store *Store, tenantID, path string) ([]byte, string) {
 	t.Helper()
+	chunk, segment := firstChunkSnapshot(t, store, tenantID, path)
+	payload, err := store.readChunkPayloadAt(segment, chunk)
+	if err != nil {
+		t.Fatalf("read first chunk payload: %v", err)
+	}
+	return payload, segment.SegmentID
+}
+
+func firstChunkSnapshot(t *testing.T, store *Store, tenantID, path string) (chunkRecord, segmentRecord) {
+	t.Helper()
 	store.metaMu.RLock()
 	inode, err := store.resolvePathLocked(tenantID, path)
 	if err != nil {
@@ -101,11 +111,66 @@ func firstChunkPayload(t *testing.T, store *Store, tenantID, path string) ([]byt
 	chunkCopy := *chunk
 	segmentCopy := *segment
 	store.metaMu.RUnlock()
-	payload, err := store.readChunkPayloadAt(segmentCopy, chunkCopy)
+	return chunkCopy, segmentCopy
+}
+
+func corruptFirstChunkPayloadByte(t *testing.T, store *Store, tenantID, path string) (chunkRecord, segmentRecord) {
+	t.Helper()
+	chunk, segment := firstChunkSnapshot(t, store, tenantID, path)
+	file, err := store.fs.OpenFile(store.segmentPath(&segment), os.O_RDWR, 0)
 	if err != nil {
-		t.Fatalf("read first chunk payload: %v", err)
+		t.Fatalf("open segment: %v", err)
 	}
-	return payload, segmentCopy.SegmentID
+	if _, err := file.Seek(chunk.SegmentOffset+recordHeaderSize, io.SeekStart); err != nil {
+		_ = file.Close()
+		t.Fatalf("seek segment: %v", err)
+	}
+	original := []byte{0}
+	if _, err := io.ReadFull(file, original); err != nil {
+		_ = file.Close()
+		t.Fatalf("read segment byte: %v", err)
+	}
+	if _, err := file.Seek(chunk.SegmentOffset+recordHeaderSize, io.SeekStart); err != nil {
+		_ = file.Close()
+		t.Fatalf("seek segment again: %v", err)
+	}
+	if _, err := file.Write([]byte{original[0] ^ 0xff}); err != nil {
+		_ = file.Close()
+		t.Fatalf("corrupt segment: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close corrupted segment: %v", err)
+	}
+	return chunk, segment
+}
+
+func markCompactionCandidatesForTest(t *testing.T, store *Store) ([]compactCandidate, *GCResult) {
+	t.Helper()
+	now := nowUnix()
+	store.metaMu.Lock()
+	ops := []metaOp{}
+	result := &GCResult{}
+	store.markUnreferencedChunksLocked(now, now+int64(time.Second), 1, result, &ops)
+	if err := store.commitMetaLocked(ops); err != nil {
+		store.metaMu.Unlock()
+		t.Fatalf("mark garbage: %v", err)
+	}
+	candidates := store.collectCompactCandidatesLocked()
+	ops = ops[:0]
+	for _, candidate := range candidates {
+		next := candidate.Source
+		next.State = segmentStateCompacting
+		ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
+	}
+	if err := store.commitMetaLocked(ops); err != nil {
+		store.metaMu.Unlock()
+		t.Fatalf("mark compacting: %v", err)
+	}
+	store.metaMu.Unlock()
+	if len(candidates) == 0 {
+		t.Fatal("expected compaction candidate")
+	}
+	return candidates, result
 }
 
 func TestInodeRenamePersistsSubtreeWithoutRewritingChildren(t *testing.T) {
@@ -288,7 +353,7 @@ func TestRunGCHonorsSegmentDeleteDelay(t *testing.T) {
 	if result.SegmentsDeleted != 0 {
 		t.Fatalf("segment deleted before delay: %+v", result)
 	}
-	store.cfg.GC.SegmentDeleteDelay = 0
+	store.cfg.GC.SegmentDeleteDelay = -1
 	result, err = store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1})
 	if err != nil {
 		t.Fatalf("gc without delay: %v", err)
@@ -334,30 +399,7 @@ func TestCompactionKeepsPinnedSourceSegmentUntilNextGC(t *testing.T) {
 	if err := store.DeleteObject(testContext(t), "tenant-a", "pinned/source"); err != nil {
 		t.Fatalf("delete source: %v", err)
 	}
-	now := nowUnix()
-	store.metaMu.Lock()
-	ops := []metaOp{}
-	gcResult := &GCResult{}
-	store.markUnreferencedChunksLocked(now, now+int64(time.Second), 1, gcResult, &ops)
-	if err := store.commitMetaLocked(ops); err != nil {
-		store.metaMu.Unlock()
-		t.Fatalf("mark garbage: %v", err)
-	}
-	candidates := store.collectCompactCandidatesLocked()
-	ops = ops[:0]
-	for _, candidate := range candidates {
-		next := candidate.Source
-		next.State = segmentStateCompacting
-		ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
-	}
-	if err := store.commitMetaLocked(ops); err != nil {
-		store.metaMu.Unlock()
-		t.Fatalf("mark compacting: %v", err)
-	}
-	store.metaMu.Unlock()
-	if len(candidates) == 0 {
-		t.Fatal("expected compaction candidate")
-	}
+	candidates, gcResult := markCompactionCandidatesForTest(t, store)
 	compacted, err := store.compactCandidates(testContext(t), candidates)
 	if err != nil {
 		t.Fatalf("compact candidates: %v", err)
@@ -384,6 +426,94 @@ func TestCompactionKeepsPinnedSourceSegmentUntilNextGC(t *testing.T) {
 	}
 	if result.SegmentsDeleted == 0 {
 		t.Fatalf("source segment was not deleted after unpin: %+v", result)
+	}
+}
+
+func TestCommitCompactionResultsDeletesOutputWhenSourceIsStale(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/stale", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := make([]byte, 768)
+	for i := range data {
+		data[i] = byte(i*13 + i/3)
+	}
+	putTestBytes(t, store, "tenant-a", "stale/source", data)
+	livePayload, oldSegmentID := firstChunkPayload(t, store, "tenant-a", "stale/source")
+	putTestBytes(t, store, "tenant-a", "stale/live", livePayload)
+	if err := store.DeleteObject(testContext(t), "tenant-a", "stale/source"); err != nil {
+		t.Fatalf("delete source: %v", err)
+	}
+
+	candidates, gcResult := markCompactionCandidatesForTest(t, store)
+	compacted, err := store.compactCandidates(testContext(t), candidates)
+	if err != nil {
+		t.Fatalf("compact candidates: %v", err)
+	}
+	var newSegments []string
+	for _, item := range compacted {
+		for _, seg := range item.Segments {
+			newSegments = append(newSegments, store.segmentPath(seg))
+		}
+	}
+	store.metaMu.Lock()
+	source := store.meta.Segments[oldSegmentID]
+	next := *source
+	next.State = segmentStateSealed
+	if err := store.commitMetaLocked([]metaOp{{Type: "put_segment", Segment: &next}}); err != nil {
+		store.metaMu.Unlock()
+		t.Fatalf("stale source: %v", err)
+	}
+	store.metaMu.Unlock()
+
+	deleted, err := store.commitCompactionResults(compacted, gcResult, nowUnix(), nowUnix())
+	if err != nil {
+		t.Fatalf("commit stale compaction: %v", err)
+	}
+	if len(deleted) == 0 {
+		t.Fatal("stale compaction output was not scheduled for deletion")
+	}
+	if err := store.removeCompactedSegments(compacted); err != nil {
+		t.Fatalf("remove compacted stale output: %v", err)
+	}
+	if _, err := store.removeSegmentFiles(testContext(t), deleted); err != nil {
+		t.Fatalf("remove stale compaction output: %v", err)
+	}
+	for _, path := range newSegments {
+		if _, err := store.fs.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("stale compaction segment still exists %s: %v", path, err)
+		}
+	}
+	if got := readTestBytes(t, store, "tenant-a", "stale/live"); !bytes.Equal(got, livePayload) {
+		t.Fatalf("live payload corrupted after stale compaction")
+	}
+}
+
+func TestRollbackCompactionResetsCompactingSegments(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/rollback", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := make([]byte, 768)
+	for i := range data {
+		data[i] = byte(i*19 + i/7)
+	}
+	putTestBytes(t, store, "tenant-a", "rollback/source", data)
+	livePayload, oldSegmentID := firstChunkPayload(t, store, "tenant-a", "rollback/source")
+	putTestBytes(t, store, "tenant-a", "rollback/live", livePayload)
+	if err := store.DeleteObject(testContext(t), "tenant-a", "rollback/source"); err != nil {
+		t.Fatalf("delete source: %v", err)
+	}
+
+	candidates, _ := markCompactionCandidatesForTest(t, store)
+	if err := store.rollbackCompaction(candidates); err != nil {
+		t.Fatalf("rollback compaction: %v", err)
+	}
+	store.metaMu.RLock()
+	source := store.meta.Segments[oldSegmentID]
+	store.metaMu.RUnlock()
+	if source == nil || source.State != segmentStateSealed {
+		t.Fatalf("source was not rolled back to sealed: %+v", source)
 	}
 }
 
@@ -614,38 +744,7 @@ func TestCheckObjectMarksCorruptSegment(t *testing.T) {
 		t.Fatalf("mkdirall: %v", err)
 	}
 	putTestBytes(t, store, "tenant-a", "corrupt/blob", bytes.Repeat([]byte("c"), 128))
-	store.metaMu.RLock()
-	inode, err := store.resolvePathLocked("tenant-a", "corrupt/blob")
-	if err != nil {
-		store.metaMu.RUnlock()
-		t.Fatalf("resolve: %v", err)
-	}
-	manifest := store.meta.Manifests[inode.ManifestID]
-	chunk := *store.meta.Chunks[manifest.Chunks[0].ChunkID]
-	segment := *store.meta.Segments[chunk.SegmentID]
-	store.metaMu.RUnlock()
-	file, err := store.fs.OpenFile(store.segmentPath(&segment), os.O_RDWR, 0)
-	if err != nil {
-		t.Fatalf("open segment: %v", err)
-	}
-	if _, err := file.Seek(chunk.SegmentOffset+recordHeaderSize, io.SeekStart); err != nil {
-		_ = file.Close()
-		t.Fatalf("seek segment: %v", err)
-	}
-	original := []byte{0}
-	if _, err := io.ReadFull(file, original); err != nil {
-		_ = file.Close()
-		t.Fatalf("read segment byte: %v", err)
-	}
-	if _, err := file.Seek(chunk.SegmentOffset+recordHeaderSize, io.SeekStart); err != nil {
-		_ = file.Close()
-		t.Fatalf("seek segment again: %v", err)
-	}
-	if _, err := file.Write([]byte{original[0] ^ 0xff}); err != nil {
-		_ = file.Close()
-		t.Fatalf("corrupt segment: %v", err)
-	}
-	_ = file.Close()
+	chunk, segment := corruptFirstChunkPayloadByte(t, store, "tenant-a", "corrupt/blob")
 	result, err := store.CheckObject(testContext(t), "tenant-a", "corrupt/blob")
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("check corrupt err = %v", err)

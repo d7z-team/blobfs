@@ -250,6 +250,47 @@ func TestDiagnoseAndRepairMissingSegmentMarksCorrupt(t *testing.T) {
 	}
 }
 
+func TestHealthAndDiagnoseReportTornMetadataLogTail(t *testing.T) {
+	fsys := afero.NewMemMapFs()
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.MkdirAll("tenant-a/replay", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "replay/blob", []byte("replay"))
+	logPath := filepath.Join("/blobfs/meta/txlog", store.metaLogName)
+	simulateCrashWithoutCheckpoint(t, store)
+	data, err := afero.ReadFile(fsys, logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	data = append(data, 0x01, 0x02, 0x03)
+	if err := afero.WriteFile(fsys, logPath, data, 0o600); err != nil {
+		t.Fatalf("append torn tail: %v", err)
+	}
+	reopened, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("reopen with torn tail: %v", err)
+	}
+	defer reopened.Close()
+	health, err := reopened.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if health.State != HealthDegraded || !hasHealthCheck(health, "metadata_log_replay", false) {
+		t.Fatalf("torn tail was not reported in health: %+v", health)
+	}
+	diagnose, err := reopened.Diagnose(testContext(t), DiagnoseOptions{})
+	if err != nil {
+		t.Fatalf("diagnose: %v", err)
+	}
+	if diagnose.Healthy || !hasIssue(diagnose, IssueMetadataLogTornTail) {
+		t.Fatalf("torn tail was not diagnosed: %+v", diagnose)
+	}
+}
+
 func markFirstSegmentCompacting(t *testing.T, store *Store) string {
 	t.Helper()
 	store.metaMu.Lock()
@@ -275,6 +316,15 @@ func firstSegmentPath(t *testing.T, store *Store) (string, string) {
 	}
 	t.Fatal("no segment found")
 	return "", ""
+}
+
+func hasHealthCheck(report *HealthReport, name string, ok bool) bool {
+	for _, check := range report.Checks {
+		if check.Name == name && check.OK == ok {
+			return true
+		}
+	}
+	return false
 }
 
 func hasIssue(report *DiagnoseReport, kind IssueKind) bool {

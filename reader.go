@@ -18,6 +18,7 @@ type ObjectReader struct {
 	buf            []byte
 	bufStart       int64
 	bufEnd         int64
+	chunkIndex     int
 	closed         bool
 	fileHash       string
 	info           ObjectInfo
@@ -97,6 +98,7 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 		offset:         rangeOffset,
 		limitEnd:       limitEnd,
 		refs:           snapshots,
+		chunkIndex:     -1,
 		fileHash:       inode.FileHash,
 		info:           objectInfoFromInode(inode, path),
 		pinnedSegments: pinned,
@@ -199,21 +201,39 @@ func (r *ObjectReader) ETag() string {
 }
 
 func (r *ObjectReader) loadChunkAtOffset(offset int64) error {
-	for _, ref := range r.refs {
-		start := ref.Ref.FileOffset
-		end := start + ref.Ref.ChunkSize
-		if offset >= start && offset < end {
-			data, err := r.store.readChunkPayloadAt(ref.Segment, ref.Chunk)
-			if err != nil {
-				return err
-			}
-			r.buf = data
-			r.bufStart = start
-			r.bufEnd = end
-			return nil
+	contains := func(index int) bool {
+		if index < 0 || index >= len(r.refs) {
+			return false
 		}
+		start := r.refs[index].Ref.FileOffset
+		return offset >= start && offset < start+r.refs[index].Ref.ChunkSize
 	}
-	return io.EOF
+	load := func(index int) error {
+		ref := r.refs[index]
+		data, err := r.store.readChunkPayloadAt(ref.Segment, ref.Chunk)
+		if err != nil {
+			return err
+		}
+		r.buf = data
+		r.bufStart = ref.Ref.FileOffset
+		r.bufEnd = ref.Ref.FileOffset + ref.Ref.ChunkSize
+		r.chunkIndex = index
+		return nil
+	}
+	if contains(r.chunkIndex) {
+		return load(r.chunkIndex)
+	}
+	if contains(r.chunkIndex + 1) {
+		return load(r.chunkIndex + 1)
+	}
+	index := sort.Search(len(r.refs), func(i int) bool {
+		ref := r.refs[i].Ref
+		return ref.FileOffset+ref.ChunkSize > offset
+	})
+	if !contains(index) {
+		return io.EOF
+	}
+	return load(index)
 }
 
 var _ io.ReadSeekCloser = (*ObjectReader)(nil)

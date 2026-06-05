@@ -7,7 +7,10 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/spf13/afero"
 )
 
 func TestParseRecordHeaderRejectsInvalidHeaders(t *testing.T) {
@@ -104,5 +107,25 @@ func TestReadPathRejectsChunkHashMismatch(t *testing.T) {
 	defer reader.Close()
 	if _, err := io.ReadAll(reader); !errors.Is(err, errChunkHashMismatch) {
 		t.Fatalf("hash-mismatched read = %v, want errChunkHashMismatch", err)
+	}
+}
+
+func TestStagingSegmentDirectoriesArePrivate(t *testing.T) {
+	fsys := afero.NewMemMapFs()
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/perms", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "perms/blob", bytes.Repeat([]byte("p"), 128))
+	info, err := store.fs.Stat(filepath.Join(store.stagingDir, "0000", "0000"))
+	if err != nil {
+		t.Fatalf("stat staging segment dir: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("staging segment dir mode = %#o", info.Mode().Perm())
 	}
 }

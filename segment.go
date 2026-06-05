@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/spf13/afero"
@@ -27,6 +28,14 @@ const (
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 var errChunkHashMismatch = errors.New("chunk hash mismatch")
+
+var zstdEncoderPool = sync.Pool{New: func() any {
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		return err
+	}
+	return enc
+}}
 
 type segmentBatchWriter struct {
 	store    *Store
@@ -115,7 +124,7 @@ func (w *segmentBatchWriter) rotate() error {
 	}
 	seg := w.store.newSegmentRecord()
 	stagingPath := w.store.stagingSegmentPath(seg)
-	if err := w.store.fs.MkdirAll(filepath.Dir(stagingPath), 0o755); err != nil {
+	if err := w.store.fs.MkdirAll(filepath.Dir(stagingPath), 0o700); err != nil {
 		return err
 	}
 	file, err := w.store.fs.OpenFile(stagingPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -151,22 +160,25 @@ func (w *segmentBatchWriter) finish() error {
 		staging := w.store.stagingSegmentPath(seg)
 		final := w.store.segmentPath(seg)
 		if err := w.store.fs.MkdirAll(filepath.Dir(final), 0o755); err != nil {
-			w.removePublished(published)
-			return err
+			return errors.Join(err, w.removePublished(published))
 		}
 		if err := w.store.fs.Rename(staging, final); err != nil {
-			w.removePublished(published)
-			return err
+			return errors.Join(err, w.removePublished(published))
 		}
 		published = append(published, seg)
 	}
 	return nil
 }
 
-func (w *segmentBatchWriter) removePublished(segments []*segmentRecord) {
+func (w *segmentBatchWriter) removePublished(segments []*segmentRecord) error {
+	var errs []error
 	for _, seg := range segments {
-		_ = w.store.fs.Remove(w.store.segmentPath(seg))
+		path := w.store.segmentPath(seg)
+		if err := w.store.fs.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove published segment %s: %w", path, err))
+		}
 	}
+	return errors.Join(errs...)
 }
 
 func (w *segmentBatchWriter) cleanup() {
@@ -281,11 +293,12 @@ func (s *Store) readChunkPayloadAt(seg segmentRecord, chunk chunkRecord) ([]byte
 }
 
 func compressZstd(raw []byte) ([]byte, error) {
-	enc, err := zstd.NewWriter(nil)
-	if err != nil {
+	item := zstdEncoderPool.Get()
+	if err, ok := item.(error); ok {
 		return nil, err
 	}
-	defer enc.Close()
+	enc := item.(*zstd.Encoder)
+	defer zstdEncoderPool.Put(enc)
 	return enc.EncodeAll(raw, make([]byte, 0, len(raw))), nil
 }
 

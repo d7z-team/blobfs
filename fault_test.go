@@ -25,6 +25,8 @@ type faultFS struct {
 	renameContains string
 	renameSkips    int
 	renameFailures int
+	removeContains string
+	removeFailures int
 }
 
 func (f *faultFS) failWritesTo(suffix string, count int) {
@@ -53,6 +55,13 @@ func (f *faultFS) failRenamesContainingAfter(fragment string, skip, count int) {
 	f.mu.Unlock()
 }
 
+func (f *faultFS) failRemovesContaining(fragment string, count int) {
+	f.mu.Lock()
+	f.removeContains = filepath.ToSlash(fragment)
+	f.removeFailures = count
+	f.mu.Unlock()
+}
+
 func (f *faultFS) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
 	file, err := f.Fs.OpenFile(name, flag, perm)
 	if err != nil {
@@ -78,6 +87,19 @@ func (f *faultFS) Rename(oldname, newname string) error {
 		return errInjectedFSFault
 	}
 	return f.Fs.Rename(oldname, newname)
+}
+
+func (f *faultFS) Remove(name string) error {
+	f.mu.Lock()
+	fail := f.removeFailures > 0 && strings.Contains(filepath.ToSlash(name), f.removeContains)
+	if fail {
+		f.removeFailures--
+	}
+	f.mu.Unlock()
+	if fail {
+		return errInjectedFSFault
+	}
+	return f.Fs.Remove(name)
 }
 
 func (f *faultFS) consumeWriteFault(name string) bool {
@@ -289,5 +311,25 @@ func TestSystemFaultLaterSegmentRenameFailureRollsBackPublishedSegments(t *testi
 	}
 	if files := countRegularFiles(t, fsys, "/blobfs/data/segments"); files != 0 {
 		t.Fatalf("published segment files were not rolled back, count=%d", files)
+	}
+}
+
+func TestSystemFaultPreparedSegmentCleanupErrorIsReturned(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	fsys.failRemovesContaining(filepath.Join("data", "segments"), 1)
+	_, err = store.Put(testContext(t), "tenant-a", "missing-parent/blob", bytes.NewReader(bytes.Repeat([]byte("x"), 128)), nil)
+	if err == nil {
+		t.Fatal("put into missing parent should fail")
+	}
+	if !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("cleanup remove fault was not returned: %v", err)
+	}
+	if _, openErr := store.OpenObject(testContext(t), "tenant-a", "missing-parent/blob"); !errors.Is(openErr, fs.ErrNotExist) {
+		t.Fatalf("failed put became visible: %v", openErr)
 	}
 }

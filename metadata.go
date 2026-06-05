@@ -182,6 +182,17 @@ type metaOp struct {
 	GCRun    *gcRun          `json:"gc_run,omitempty"`
 }
 
+type metadataLoadReport struct {
+	ReplayWarnings []metadataReplayWarning
+}
+
+type metadataReplayWarning struct {
+	Path   string
+	Offset int64
+	Bytes  int
+	Reason string
+}
+
 type metaSuperBlock struct {
 	FormatVersion  int    `json:"format_version"`
 	CheckpointTxID uint64 `json:"checkpoint_txid"`
@@ -204,28 +215,29 @@ func newMetadata() *metadata {
 	}
 }
 
-func loadMetadata(fs afero.Fs, metaDir string) (*metadata, string, error) {
+func loadMetadata(fs afero.Fs, metaDir string) (*metadata, string, metadataLoadReport, error) {
 	meta := newMetadata()
 	if err := fs.MkdirAll(filepath.Join(metaDir, "txlog"), 0o755); err != nil {
-		return nil, "", err
+		return nil, "", metadataLoadReport{}, err
 	}
 	if err := loadMetaCheckpoint(fs, filepath.Join(metaDir, metaCheckpointFile), meta); err != nil {
-		return nil, "", err
+		return nil, "", metadataLoadReport{}, err
 	}
 	super, err := loadMetaSuperBlock(fs, metaDir)
 	if err != nil {
-		return nil, "", err
+		return nil, "", metadataLoadReport{}, err
 	}
 	logFile := super.LogFile
 	if logFile == "" {
 		logFile = metaLogFile
 	}
-	if err := replayMetaLog(fs, filepath.Join(metaDir, "txlog", logFile), meta); err != nil {
-		return nil, "", err
+	report, err := replayMetaLog(fs, filepath.Join(metaDir, "txlog", logFile), meta)
+	if err != nil {
+		return nil, "", metadataLoadReport{}, err
 	}
 	recoverInProgressMetadata(meta)
 	recomputeMetaCounters(meta)
-	return meta, logFile, nil
+	return meta, logFile, report, nil
 }
 
 func loadMetaCheckpoint(fs afero.Fs, path string, meta *metadata) error {
@@ -243,49 +255,71 @@ func loadMetaCheckpoint(fs afero.Fs, path string, meta *metadata) error {
 	return nil
 }
 
-func replayMetaLog(fs afero.Fs, path string, meta *metadata) error {
+func replayMetaLog(fs afero.Fs, path string, meta *metadata) (metadataLoadReport, error) {
+	var report metadataLoadReport
 	file, err := fs.Open(path)
 	if os.IsNotExist(err) {
-		return nil
+		return report, nil
 	}
 	if err != nil {
-		return err
+		return report, err
 	}
 	defer file.Close()
+	var offset int64
 	for {
 		var header [12]byte
-		if _, err := io.ReadFull(file, header[:]); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil
+		n, err := io.ReadFull(file, header[:])
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return report, nil
 			}
-			return err
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				report.ReplayWarnings = append(report.ReplayWarnings, metadataReplayWarning{
+					Path:   path,
+					Offset: offset,
+					Bytes:  n,
+					Reason: "partial metadata log frame header ignored",
+				})
+				return report, nil
+			}
+			return report, err
 		}
 		if binary.LittleEndian.Uint32(header[0:4]) != metaFrameMagic {
-			return errors.New("invalid metadata log frame magic")
+			return report, errors.New("invalid metadata log frame magic")
 		}
 		size := binary.LittleEndian.Uint32(header[4:8])
 		wantCRC := binary.LittleEndian.Uint32(header[8:12])
 		if size == 0 || size > 64<<20 {
-			return errors.New("invalid metadata log frame size")
+			return report, errors.New("invalid metadata log frame size")
 		}
+		offset += int64(len(header))
 		payload := make([]byte, size)
-		if _, err := io.ReadFull(file, payload); err != nil {
+		n, err = io.ReadFull(file, payload)
+		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil
+				report.ReplayWarnings = append(report.ReplayWarnings, metadataReplayWarning{
+					Path:   path,
+					Offset: offset,
+					Bytes:  n,
+					Reason: "partial metadata log frame payload ignored",
+				})
+				return report, nil
 			}
-			return err
+			return report, err
 		}
 		if crc32.ChecksumIEEE(payload) != wantCRC {
-			return errors.New("metadata log frame checksum mismatch")
+			return report, errors.New("metadata log frame checksum mismatch")
 		}
 		var tx metaTx
 		if err := json.Unmarshal(payload, &tx); err != nil {
-			return err
+			return report, err
 		}
 		if tx.TxID <= meta.TxID {
+			offset += int64(size)
 			continue
 		}
 		applyMetaTx(meta, tx)
+		offset += int64(size)
 	}
 }
 

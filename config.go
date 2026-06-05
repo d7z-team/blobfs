@@ -192,13 +192,23 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if emptyGC {
 		cfg.GC = def.GC
-	} else {
-		if cfg.GC.CandidateConfirmCycles == 0 {
-			cfg.GC.CandidateConfirmCycles = def.GC.CandidateConfirmCycles
-		}
-		if cfg.GC.CompactGarbageRatio == 0 {
-			cfg.GC.CompactGarbageRatio = def.GC.CompactGarbageRatio
-		}
+		return cfg
+	}
+	if cfg.GC.CandidateConfirmCycles == 0 {
+		cfg.GC.CandidateConfirmCycles = def.GC.CandidateConfirmCycles
+	}
+	if cfg.GC.SafetyWindow == 0 {
+		cfg.GC.SafetyWindow = def.GC.SafetyWindow
+	} else if cfg.GC.SafetyWindow < 0 {
+		cfg.GC.SafetyWindow = 0
+	}
+	if cfg.GC.SegmentDeleteDelay == 0 {
+		cfg.GC.SegmentDeleteDelay = def.GC.SegmentDeleteDelay
+	} else if cfg.GC.SegmentDeleteDelay < 0 {
+		cfg.GC.SegmentDeleteDelay = 0
+	}
+	if cfg.GC.CompactGarbageRatio == 0 {
+		cfg.GC.CompactGarbageRatio = def.GC.CompactGarbageRatio
 	}
 	return cfg
 }
@@ -236,9 +246,6 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.GC.CandidateConfirmCycles <= 0 {
 		return errors.New("candidate confirm cycles must be positive")
-	}
-	if cfg.GC.SafetyWindow < 0 || cfg.GC.SegmentDeleteDelay < 0 {
-		return errors.New("gc durations must be non-negative")
 	}
 	if cfg.GC.CompactGarbageRatio <= 0 || cfg.GC.CompactGarbageRatio > 1 {
 		return errors.New("compact garbage ratio must be within (0, 1]")

@@ -1,61 +1,47 @@
-# BlobFS 核心设计
+# BlobFS 设计文档
 
-BlobFS 是一个本地内容寻址文件存储库。它把文件抽象为 manifest，把文件内容切成 chunk，并把所有 chunk 追加写入 segment 文件。`Store` 直接实现 `github.com/spf13/afero.Fs`，可以作为 VFS 使用。
+BlobFS 是一个本地海量对象存储库。核心目标是用简单的 Go 代码实现内容寻址、去重、可恢复 metadata、append-only 数据文件、显式目录和可控 GC，metadata log 直接内建于本地目录。
 
-## 架构
+## 设计目标
 
-```text
-Client / afero.Fs
-  -> Store API
-      -> Metadata
-          -> Manifest
-              -> Chunk[]
-                  -> Segment record
-```
+- 数据内容按 chunk 做 CAS 存储，读路径校验 chunk hash。
+- 文件系统 metadata 与物理数据分离，前台写入只提交短事务。
+- segment append 写入，将 payload 聚合到顺序写的大文件中。
+- 数据生命周期由 metadata tombstone、GC 和 compaction 管理。
+- 海量目录操作采用 metadata-only rename 和 detach 语义。
+- 恢复和观测提供薄 struct API，调用方可按需封装 HTTP、Prometheus 或 OpenTelemetry。
 
-逻辑关系：
+## 核心模型
 
 ```text
-file path -> file record -> manifest -> chunk refs -> chunk metadata -> segment location
+tenant/path
+  -> inode
+  -> manifest
+  -> manifest chunk refs
+  -> chunk metadata
+  -> segment record
+  -> compressed payload
 ```
 
-物理数据只写入 segment；元数据记录 file、manifest、chunk、segment 的状态和位置。
+主要记录：
 
-租户是路径和去重的隔离边界。VFS 路径格式是：
+- `tenant`: tenant id 到 root inode 的映射。
+- `inode`: 文件或目录记录，包含父 inode、名称、大小、manifest、mode、mtime、generation 等。
+- `dir_entry`: 目录 inode 到子名称和子 inode 的索引。
+- `manifest`: 文件内容快照，保存 chunk refs 和文件 hash。
+- `chunk`: CAS chunk 元数据，保存 segment 位置、大小、refcount、状态和校验信息。
+- `segment`: 物理 segment 文件元数据，保存路径、写入偏移、状态和时间戳。
+
+状态集合：
 
 ```text
-tenant_id/path/to/file
+inode:    ACTIVE, DELETED
+manifest: ACTIVE, DELETED
+chunk:    ACTIVE, GARBAGE_CANDIDATE, DELETED, CORRUPT
+segment:  SEALED, COMPACTING, DELETED, CORRUPT
 ```
 
-标准库 `io/fs` 消费方使用 `TenantFS(tenantID)`，得到以该租户为根的只读 `fs.FS` 视图。
-
-## 文件切分
-
-所有写入都使用同一个流式内容定义切分器，不再维护独立的小文件阈值。输入小于当前 `MaxSize` 时会自然形成单 chunk manifest；更大的输入按 FastCDC-style 边界切分。默认参数：
-
-```text
-min chunk: 512 KiB
-avg chunk: 4 MiB
-max chunk: 16 MiB
-```
-
-## 去重
-
-默认租户内去重：
-
-```text
-DedupScopeTenant:
-  chunk_id = sha256(tenant_id || bytes)
-
-DedupScopeGlobal:
-  chunk_id = sha256(bytes)
-```
-
-同租户、同内容、同大小的文件会复用 manifest。大文件的重复内容会复用已有 chunk。
-
-## Segment 存储
-
-目录布局：
+## 存储布局
 
 ```text
 base/
@@ -73,18 +59,29 @@ base/
         0000/
           0000000000000001.blob
     staging/
+      sessions/
 ```
 
-规则：
+`segments` 使用固定两级 fanout，每级 1024 桶。segment 文件按 record 追加写入，payload 通过新 segment 表达更新。staging 目录用于写入前的临时 segment 和 VFS write session。
 
-- 只有一个 blob 根目录。
-- segment 使用固定两级 fanout，每级 1024 桶。
-- segment 文件名是纯数字 `.blob`。
-- segment 文件权限不带执行位。
-- payload 使用 zstd 压缩。
-- record 使用 CRC32C 校验压缩后的 payload。
+## Chunk 与 Segment
 
-segment record：
+写入流经过 FastCDC-style 内容定义切分。默认 chunk 参数：
+
+```text
+min: 512 KiB
+avg: 4 MiB
+max: 16 MiB
+```
+
+chunk id 由 SHA-256 计算：
+
+```text
+DedupScopeTenant: sha256(tenant_id || bytes)
+DedupScopeGlobal: sha256(bytes)
+```
+
+segment record 内容：
 
 ```text
 record_magic
@@ -94,200 +91,126 @@ chunk_id
 raw_size
 stored_size
 compression
-checksum
+checksum_crc32c
 payload_length
 payload
 ```
 
-读取时会校验 record header、payload length、CRC32C、解压后大小和 chunk hash。
+payload 使用 zstd 压缩。读取 chunk 时校验 record header、payload length、CRC32C、解压后大小和 CAS chunk hash；校验通过后返回数据，校验失败会报告读取错误。
 
-## Metadata
+## Metadata 持久化
 
-当前元数据存储为 typed metadata transaction log：
-
-```text
-meta/SUPER0
-meta/SUPER1
-meta/checkpoint.json
-meta/txlog/<active-generation>.log
-```
-
-核心记录：
+metadata 使用 checkpoint + append-only txlog：
 
 ```text
-tenants:
-  tenant_id -> root inode
-
-inodes:
-  inode_id
-  tenant_id
-  name
-  parent_inode
-  kind
-  size
-  file_hash
-  manifest_id
-  state
-  options
-  mode
-  mod_time
-  uid
-  gid
-  generation
-  content_generation
-  metadata_generation
-  ctime
-  mtime
-  atime
-  created_at
-  updated_at
-  deleted_at
-
-dir_entries:
-  parent_inode -> child_name -> child_inode
-
-manifests:
-  manifest_id
-  tenant_id
-  file_size
-  file_hash
-  chunk_count
-  chunking_type
-  chunks
-  state
-  ref_count
-  created_at
-  last_live_at
-  deleted_at
-
-chunks:
-  chunk_id
-  tenant_id
-  raw_size
-  stored_size
-  ref_count
-  state
-  segment_id
-  segment_offset
-  segment_length
-  checksum_crc32c
-  compression
-  garbage_candidate_at
-  garbage_seen_count
-  deleted_at
-  corruption fields
-
-segments:
-  segment_id
-  relative_path
-  write_offset
-  total_bytes
-  state
-  timestamps
+checkpoint.json
+txlog/<active-generation>.log
+SUPER0 / SUPER1
 ```
 
-状态：
+事务提交顺序：
 
 ```text
-file:      ACTIVE, DELETED
-file kind: FILE, DIR
-manifest:  ACTIVE, DELETED
-chunk:     ACTIVE, GARBAGE_CANDIDATE, DELETED, CORRUPT
-segment:   SEALED, COMPACTING, DELETED, CORRUPT
+write txlog frame
+fsync txlog
+apply in-memory metadata
+update SUPER checkpoint txid/log generation
 ```
 
-目录是显式 inode/dentry 记录。BlobFS 不从 `a/b.txt` 自动合成 `a`，所以写入嵌套 object 前必须先创建父目录。目录列表只依赖 `dir_entries`，不扫描全量文件名。目录 rename 移动的是父目录项和目录 inode，不扫描或改写子树。
+txlog frame 包含 magic、payload size、CRC 和 JSON transaction。完整 frame CRC 错误会使打开流程进入错误返回；崩溃造成的 torn tail 会按最后一个完整 frame 恢复，并通过 `Health` / `Diagnose` 报告 degraded warning。
 
-`checkpoint.json` 是周期性 checkpoint，用来压缩 metadata 并限制启动 replay 成本。事务先写入当前 txlog 并 fsync；checkpoint 成功后写入紧凑 snapshot，创建并同步新一代空 txlog，再通过 `SUPER0`/`SUPER1` 切换活动 log。旧 log 只在切换成功后关闭和删除，因此 checkpoint 失败不会破坏仍可继续提交的旧 txlog。
+checkpoint 会写入紧凑 metadata snapshot，创建并同步新一代空 txlog，然后通过 `SUPER0` / `SUPER1` 切换活动 log。旧 log 在切换成功后删除；checkpoint 失败时继续使用原活动 txlog。
 
-checkpoint 会裁剪不再需要的 deleted inode、manifest、chunk、segment 记录。GC 历史保存总运行次数、最后 epoch 和最近窗口，避免长期后台 GC 让 checkpoint JSON 单调膨胀。
+checkpoint compaction 会清理已经完成生命周期的 deleted inode、manifest、chunk、segment，并裁剪 GC recent history。GC 总运行次数和最后 epoch 单独保存，让 checkpoint 大小保持有界。
 
-## 写入
+## 写入流程
 
 ```text
-1. 校验 context、tenant、path 和 reader
-2. 流式读取输入并执行 FastCDC chunking
-3. 计算 scoped file hash 和 chunk hash
-4. 将缺失 chunk 写入 staging segment
-5. fsync segment 并 rename 到可见 data/segments
-6. 短 metadata transaction 校验父目录和 generation
-7. 写 chunk、manifest、inode 和 dentry transaction
-8. 周期性更新 checkpoint/SUPER 以压缩 metadata log
+1. 校验 context、tenant、path、reader 和配置限制
+2. 流式切分 chunk，计算 file hash 和 chunk hash
+3. 已存在且可读的 chunk 会被 pin 后复用
+4. 新 chunk 写入 staging segment
+5. staging segment fsync 后 rename 到 data/segments
+6. metadata 短事务校验父目录、generation 和复用 chunk 可读性
+7. 提交 segment、chunk、manifest、inode、dir_entry
+8. 达到阈值后 checkpoint
 ```
 
-顺序要求：
+写入顺序约束：
 
 ```text
-staging segment payload -> visible segment -> metadata txlog -> inode visible
+payload durable -> segment visible -> metadata durable -> inode visible
 ```
 
-这样 inode 可见时，它引用的 chunk 已经可读。
+metadata 提交失败时，对象保持未发布状态；已准备的 segment 会被清理，清理失败会随错误返回。
 
-VFS 写入使用临时 write session：
+## 读取流程
+
+`OpenObject` 会在打开时复制 manifest/chunk/segment 快照，并 pin 对应 segment，保证 reader 生命周期内的 segment 保持可读。`ObjectReader` 顺序读优先命中当前或下一个 chunk，随机 seek 使用二分定位 chunk。
+
+读取流程：
 
 ```text
-OpenFile/OpenFileContext writable
-  -> 创建 data/staging/sessions/session-*.tmp
-  -> 受 MaxOpenWriteSessions 限制，避免无限临时写会话放大
-  -> 复制旧内容或从空文件开始
-  -> Write/WriteAt/Truncate 修改 session
-  -> File.Sync 或 Close 执行一次带 base generation 的提交
+resolve inode
+load manifest refs
+validate chunk and segment state
+pin segments
+read segment payload
+verify CRC, size, chunk hash
+return bytes
 ```
 
-如果打开句柄后同一路径被其他写入修改，提交会返回 `ErrConflict`。新建句柄在关闭前如果同路径已经被创建，也会返回 `ErrConflict`。`OpenFileContext` 提供最薄的可取消 VFS 写接口：传入的 context 会用于打开阶段读取旧内容，以及之后的 `Sync`/`Close` 提交。
+`OpenRange` 使用相同快照语义，只限制 reader 的 logical range。
 
-## 读取
+## 目录与 VFS
 
-普通读取：
+BlobFS 的目录是显式 inode 和 dentry，父目录由 `Mkdir` / `MkdirAll` 创建。写入 `a/b.txt` 前先创建 `a`。
+
+`*Store` 实现 `afero.Fs`，路径格式为：
 
 ```text
-file -> manifest -> chunks -> segment payload -> decompress -> stream
+tenant_id/path/to/file
 ```
 
-Range 读取：
+`TenantFS(tenantID)` 返回以 tenant 为根的只读 `io/fs.FS`。
+
+VFS 写入使用 write session：
 
 ```text
-1. 根据 offset 和 length 定位相关 chunk
-2. 读取必要 chunk
-3. 解压后裁剪首尾
-4. 返回 reader
+OpenFile/OpenFileContext
+  -> data/staging/sessions/session-*.tmp
+  -> copy old content when needed
+  -> Write/WriteAt/Truncate update session
+  -> Sync or Close commits through Put path
 ```
 
-读取会拒绝不可读的 chunk 和 segment 状态，并在返回 bytes 前校验 record header、payload length、CRC32C、解压后大小和 CAS chunk hash。
+`MaxOpenWriteSessions` 限制同时打开的写 session。提交使用 base generation 检查；如果文件在句柄打开后被其他写入修改，返回 `ErrConflict`。`OpenFileContext` 的 context 会用于打开阶段和后续 `Sync` / `Close` 提交。
 
-## 元数据更新
+目录 rename 更新目录 inode 的父指针和 dentry，子树保持原 inode 结构。子路径通过 inode 父链解析。`RemoveAll` 立即删除父目录项并 tombstone 顶层 inode，子树内脱离目录树的 inode 和引用由后续 GC 释放。
 
-`UpdateMetadata` 只替换文件的 string key/value metadata：
+## 删除、GC 与 Compaction
+
+删除先更新 metadata，物理数据由 GC 在后续周期回收：
 
 ```text
-content identity 不变
-manifest_id 不变
-file_hash 不变
-chunk 不重写
+inode -> DELETED
+manifest refcount--
+chunk refcount--
 ```
 
-VFS 的 mode、mtime、uid、gid、generation 等文件系统扩展字段保存在 file record 中，不写入 chunk。
-
-## 删除与 GC
-
-删除是元数据 tombstone：
+GC 流程：
 
 ```text
-file.state = DELETED
-manifest 无 active file 引用时 state = DELETED
+1. 标记 GC 可回收 inode
+2. 根据 active manifest 统计 live chunk
+3. 未引用 chunk 进入 GARBAGE_CANDIDATE
+4. 达到确认轮数后 chunk -> DELETED
+5. 根据 segment 垃圾比例选择 compaction candidate
+6. 将 live chunks 重写到新 segment
+7. fully dead segment 到达删除延迟后删除文件并标记 DELETED
 ```
 
-物理空间由 GC 回收：
-
-```text
-1. 扫描 active files
-2. 得到 live manifests
-3. 得到 live chunks
-4. 不可达 chunk 第一轮标记 GARBAGE_CANDIDATE
-5. 达到确认轮数后标记 DELETED
-6. segment 垃圾比例达到阈值时 compact
-7. 无 live chunk 的 segment 到达删除延迟窗口后移除
-```
+segment pin 会保护正在被 reader 或 prepared write 复用的 segment。compaction 结果提交时会再次校验 source segment 和 chunk 位置，保证并发状态变化时迁移结果可回滚。
 
 默认 GC 配置：
 
@@ -298,113 +221,46 @@ SegmentDeleteDelay: 24h
 CompactGarbageRatio: 0.6
 ```
 
-## 损坏检查
+GC duration 字段中，`0` 表示使用默认值，小于 `0` 的值表示显式关闭对应等待窗口。测试或本地工具需要立即回收时可使用小于 `0` 的值。
 
-`CheckObject` 校验单个 active object。
+## 恢复与观测 API
 
-`Scrub` 扫描已存 chunk，可选校验 active file 拼接后的 hash。
-
-检查内容：
-
-```text
-manifest chunk ref
-chunk metadata
-segment metadata
-segment file
-record header
-payload length
-CRC32C
-zstd decompress
-raw size
-chunk hash
-file hash
-```
-
-发现损坏后，相关 chunk 或 segment 会进入 `CORRUPT` 状态，读取和去重复用会避开这些数据。
-
-## 故障恢复与观测
-
-BlobFS core 只提供原始 struct API，不内置 HTTP、Prometheus 或 OpenTelemetry 封装：
+BlobFS 暴露薄 API，调用方可自行封装服务端、handler 和指标系统：
 
 ```go
 Health(ctx)
 Stats(ctx)
 Diagnose(ctx, opts)
 Repair(ctx, opts)
+RemoveStaleLock(baseDir)
+RemoveFSStaleLock(fs, baseDir)
 ```
 
-`Health` 做轻量检查，用于判断 store 是否 open、metadata 是否加载、txlog 和数据目录是否可用、是否存在 corrupt 或 compacting 状态。它不扫描所有 segment。
+`Health` 做轻量 metadata 和路径可用性检查。它会报告 store 状态、metadata 加载状态、txlog 写入状态、checkpoint 健康状态、corrupt/compacting 状态，以及 torn txlog tail replay 状态。
 
-`Health` 会在 metadata 锁下读取 txlog 和 checkpoint 状态；checkpoint 持久化失败会报告 `DEGRADED`，但只要 txlog 仍可写，不会误报为只读。
+`Stats` 聚合内存 metadata，用于获取租户、inode、manifest、chunk、segment、字节和 GC 计数。
 
-`Stats` 只从内存 metadata 聚合租户、inode、manifest、chunk、segment、字节和 GC 计数，不触发磁盘扫描。GC 计数是总次数和最后 epoch，不依赖无限增长的历史数组。
-
-`Diagnose` 默认无副作用，可按选项扫描：
+`Diagnose` 默认 dry-run 语义，可选扫描：
 
 ```text
-CheckFiles:   检查 metadata 引用的 segment 文件是否存在
-CheckOrphans: 扫 data/segments 中未被 metadata 引用的文件
-CheckStaging: 扫 data/staging 残留临时文件
-MaxIssues:    限制返回数量
+CheckFiles:   metadata 引用的 segment 文件是否存在
+CheckOrphans: data/segments 下未被 metadata 引用的文件
+CheckStaging: data/staging 残留文件
+MaxIssues:    返回问题数量上限
 ```
 
-`Repair` 只支持低风险动作，默认返回 dry-run 计划；只有 `Apply: true` 且未设置 `DryRun` 时才执行：
+`Repair` 面向低风险动作，默认 dry-run；设置 `Apply: true` 后执行修改：
 
 ```text
-CleanStaging:       删除 staging 临时文件
-CleanOrphans:       删除 orphan segment 文件
-ResetCompacting:    将残留 COMPACTING segment 恢复为 SEALED
-MarkMissingCorrupt: segment 文件缺失时标记相关 segment/chunk 为 CORRUPT
+CleanStaging
+CleanOrphans
+ResetCompacting
+MarkMissingCorrupt
 ```
 
-高风险动作不在 `Repair` 中自动执行：不截断 txlog、不重建 manifest、不猜测缺失 chunk 内容。异常退出残留的 `LOCK` 会阻止 reopen；确认没有存活进程持有该 store 后，可显式调用 `RemoveStaleLock(baseDir)` 或 `RemoveFSStaleLock(fs, baseDir)` 删除 stale lock。
+txlog 截断、manifest 重建、缺失 chunk 内容重建属于调用方显式恢复流程。异常退出留下的 `LOCK` 会保护 store 独占打开语义；确认 store 所有权后，调用 `RemoveStaleLock` 或 `RemoveFSStaleLock` 显式清理。
 
-`Close` 会先停止后台 GC、等待已进入的写入/GC/修复操作结束，再 checkpoint 并关闭 metadata log，避免后台 goroutine 在 txlog 关闭后继续写入。
-
-## VFS
-
-`*Store` 实现 `afero.Fs`，同时提供 `TenantFS(tenantID) fs.FS`。
-
-路径格式：
-
-```text
-tenant/path
-```
-
-VFS 支持：
-
-```text
-Create
-Open
-OpenFile
-OpenFileContext
-Mkdir
-MkdirAll
-Remove
-RemoveAll
-Rename
-Stat
-Chmod
-Chown
-Chtimes
-TenantFS
-```
-
-普通文件默认清除执行位。设置 `AllowExecutableFiles` 后，VFS 文件可以保留执行位。目录、atime、mtime、uid、gid 存在 BlobFS 元数据中，tenant root 也使用对应的 root inode 元数据。
-
-`RemoveAll` 的前台语义是 metadata detach：父目录项立即删除，路径立即不可见。子树内 inode、manifest 和 chunk 引用由后续 GC 扫描不可达 inode 后释放，避免在前台请求中递归遍历海量子树。
-
-安全规则：
-
-```text
-tenant_id 只能包含字母、数字、_、-、.
-object path 必须是相对路径
-禁止空组件、.、..、NUL 和绝对路径
-禁止跨 tenant rename
-禁止把文件写到目录路径
-禁止在文件路径下创建子项
-目录非空时 Remove/Rename overwrite 会失败
-```
+`StartBackground` 同一时间只允许一组后台 worker。`Close` 会先取消 store context，等待后台 GC 和已进入的操作结束，然后 checkpoint 并关闭 txlog。
 
 ## 配置
 
@@ -452,4 +308,22 @@ Compression: zstd
 Checksum: crc32c
 DedupScope: tenant
 Chunking: FastCDC
+GC.SafetyWindow: 24h
+GC.CandidateConfirmCycles: 2
+GC.SegmentDeleteDelay: 24h
+GC.CompactGarbageRatio: 0.6
 ```
+
+## 路径规则
+
+```text
+tenant_id 只能包含字母、数字、_、-、.
+object path 必须是相对路径
+path component 使用普通名称，保留 .、..、NUL 和绝对路径给系统语义
+rename 在同一 tenant 内执行
+文件写入目标是普通文件路径
+目录子项创建在目录路径下执行
+普通文件默认清除执行位
+```
+
+BlobFS 是本地库，stale lock 的所有权判定由调用方完成。删除 stale lock 前需确认 store 当前归属。

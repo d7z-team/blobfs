@@ -35,6 +35,7 @@ type Store struct {
 	metaLogName            string
 	commitsSinceCheckpoint int
 	lastCheckpointErr      error
+	recoveryWarnings       []metadataReplayWarning
 
 	pinMu sync.Mutex
 	pins  map[string]int
@@ -44,6 +45,7 @@ type Store struct {
 
 	lifeMu  sync.Mutex
 	closing bool
+	bgRuns  bool
 	opWG    sync.WaitGroup
 	bgWG    sync.WaitGroup
 	ctx     context.Context
@@ -52,6 +54,9 @@ type Store struct {
 	closeOnce sync.Once
 	closed    chan struct{}
 }
+
+// ErrBackgroundRunning is returned when background workers are already active.
+var ErrBackgroundRunning = errors.New("background workers are already running")
 
 // PutResult describes the committed file record and manifest created or reused by Put.
 type PutResult struct {
@@ -164,11 +169,13 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	store.meta, store.metaLogName, err = loadMetadata(fs, store.metaDir)
+	var loadReport metadataLoadReport
+	store.meta, store.metaLogName, loadReport, err = loadMetadata(fs, store.metaDir)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
 	}
+	store.recoveryWarnings = append([]metadataReplayWarning(nil), loadReport.ReplayWarnings...)
 	if err := store.cleanupStagingAndOrphans(); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -238,7 +245,9 @@ func (s *Store) putObject(ctx context.Context, tenantID, path string, input io.R
 	if err != nil {
 		var commitErr metadataCommitError
 		if !errors.As(err, &commitErr) {
-			s.removePreparedSegments(prepared)
+			if cleanupErr := s.removePreparedSegments(prepared); cleanupErr != nil {
+				return nil, errors.Join(err, cleanupErr)
+			}
 		}
 		return nil, err
 	}
@@ -656,12 +665,22 @@ func (s *Store) StartBackground(ctx context.Context) error {
 		s.lifeMu.Unlock()
 		return os.ErrClosed
 	}
+	if s.bgRuns {
+		s.lifeMu.Unlock()
+		return ErrBackgroundRunning
+	}
+	s.bgRuns = true
 	s.bgWG.Add(1)
 	s.lifeMu.Unlock()
 	ticker := time.NewTicker(time.Minute)
 	go func() {
-		defer s.bgWG.Done()
-		defer ticker.Stop()
+		defer func() {
+			ticker.Stop()
+			s.lifeMu.Lock()
+			s.bgRuns = false
+			s.lifeMu.Unlock()
+			s.bgWG.Done()
+		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -1038,11 +1057,19 @@ func (s *Store) releasePreparedPins(prepared *preparedObject) {
 	prepared.pinned = nil
 }
 
-func (s *Store) removePreparedSegments(prepared *preparedObject) {
+func (s *Store) removePreparedSegments(prepared *preparedObject) error {
+	var errs []error
 	for _, seg := range prepared.segments {
-		_ = s.fs.Remove(s.segmentPath(seg))
-		_ = s.fs.Remove(s.stagingSegmentPath(seg))
+		segmentPath := s.segmentPath(seg)
+		if err := s.fs.Remove(segmentPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove prepared segment %s: %w", segmentPath, err))
+		}
+		stagingPath := s.stagingSegmentPath(seg)
+		if err := s.fs.Remove(stagingPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove prepared staging segment %s: %w", stagingPath, err))
+		}
 	}
+	return errors.Join(errs...)
 }
 
 func (s *Store) cleanupStagingAndOrphans() error {

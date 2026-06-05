@@ -564,10 +564,15 @@ func (s *Store) listDir(tenantID, path string, root bool) []os.FileInfo {
 }
 
 func (s *Store) isDescendantLocked(nodeID, ancestorID uint64) bool {
+	seen := map[uint64]bool{}
 	for nodeID != 0 {
 		if nodeID == ancestorID {
 			return true
 		}
+		if seen[nodeID] {
+			return true
+		}
+		seen[nodeID] = true
 		inode := s.meta.Inodes[nodeID]
 		if inode == nil {
 			return false

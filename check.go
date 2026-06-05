@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -130,38 +131,20 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 		return nil, err
 	}
 	defer s.endOp()
+
 	s.metaMu.RLock()
-	snapshots := make([]chunkCheckSnapshot, 0, len(s.meta.Chunks))
-	affected := map[string][]string{}
-	for _, inode := range s.meta.Inodes {
-		if inode.State != fileStateActive || inode.Kind != fileKindFile {
+	chunkIDs := make([]string, 0, len(s.meta.Chunks))
+	for chunkID, chunk := range s.meta.Chunks {
+		if chunk == nil || chunk.State == chunkStateDeleted || chunk.SegmentID == "" {
 			continue
 		}
-		manifest := s.meta.Manifests[inode.ManifestID]
-		if manifest == nil {
-			continue
-		}
-		path := s.pathForInodeLocked(inode.InodeID)
-		for _, ref := range manifest.Chunks {
-			affected[ref.ChunkID] = append(affected[ref.ChunkID], inode.TenantID+"/"+path)
-		}
+		chunkIDs = append(chunkIDs, chunkID)
 	}
-	for _, chunk := range s.meta.Chunks {
-		if chunk.State == chunkStateDeleted || chunk.SegmentID == "" {
-			continue
-		}
-		snap := chunkCheckSnapshot{Chunk: *chunk, HasChunk: true}
-		if seg := s.meta.Segments[chunk.SegmentID]; seg != nil {
-			snap.Segment = *seg
-			snap.HasSeg = true
-		}
-		snapshots = append(snapshots, snap)
-	}
-	files := make([]inodeRecord, 0, len(s.meta.Inodes))
+	fileIDs := make([]uint64, 0, len(s.meta.Inodes))
 	if opts.CheckFiles {
-		for _, inode := range s.meta.Inodes {
-			if inode.State == fileStateActive && inode.Kind == fileKindFile {
-				files = append(files, *inode)
+		for inodeID, inode := range s.meta.Inodes {
+			if inode != nil && inode.State == fileStateActive && inode.Kind == fileKindFile {
+				fileIDs = append(fileIDs, inodeID)
 			}
 		}
 	}
@@ -172,10 +155,22 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 	seenCorruptChunks := map[string]bool{}
 	seenCorruptSegments := map[string]bool{}
 	seenAffected := map[string]bool{}
-	for _, snap := range snapshots {
+	for _, chunkID := range chunkIDs {
 		if err := contextError(ctx); err != nil {
 			return result, err
 		}
+		s.metaMu.RLock()
+		chunk := s.meta.Chunks[chunkID]
+		if chunk == nil || chunk.State == chunkStateDeleted || chunk.SegmentID == "" {
+			s.metaMu.RUnlock()
+			continue
+		}
+		snap := chunkCheckSnapshot{Chunk: *chunk, HasChunk: true}
+		if seg := s.meta.Segments[chunk.SegmentID]; seg != nil {
+			snap.Segment = *seg
+			snap.HasSeg = true
+		}
+		s.metaMu.RUnlock()
 		raw, issue := s.checkChunkSnapshot(snap)
 		result.CheckedChunks++
 		if snap.HasSeg && !seenSegments[snap.Segment.SegmentID] {
@@ -189,7 +184,9 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 		result.Issues = append(result.Issues, *issue)
 		if issue.ChunkID != "" {
 			seenCorruptChunks[issue.ChunkID] = true
-			for _, fileKey := range affected[issue.ChunkID] {
+			paths, pathIssues := s.pathsForChunk(issue.ChunkID)
+			result.Issues = append(result.Issues, pathIssues...)
+			for _, fileKey := range paths {
 				seenAffected[fileKey] = true
 			}
 		}
@@ -197,16 +194,28 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 			seenCorruptSegments[issue.SegmentID] = true
 		}
 	}
-	for _, file := range files {
-		path := s.pathForInode(file.InodeID)
-		check, err := s.checkObject(ctx, file.TenantID, path)
+	for _, fileID := range fileIDs {
+		s.metaMu.RLock()
+		inode := s.meta.Inodes[fileID]
+		if inode == nil || inode.State != fileStateActive || inode.Kind != fileKindFile {
+			s.metaMu.RUnlock()
+			continue
+		}
+		tenantID := inode.TenantID
+		path, pathErr := s.pathForInodeLocked(fileID)
+		s.metaMu.RUnlock()
 		result.CheckedFiles++
+		if pathErr != nil {
+			result.Issues = append(result.Issues, CheckIssue{Kind: "inode_parent_invalid", ID: inodeFileID(fileID), TenantID: tenantID, Reason: pathErr.Error()})
+			continue
+		}
+		check, err := s.checkObject(ctx, tenantID, path)
 		if err != nil && !errors.Is(err, ErrCorrupt) {
 			return result, err
 		}
 		if check != nil && len(check.Issues) > 0 {
 			result.Issues = append(result.Issues, check.Issues...)
-			seenAffected[file.TenantID+"/"+path] = true
+			seenAffected[tenantID+"/"+path] = true
 		}
 	}
 	for id := range seenCorruptChunks {
@@ -229,6 +238,39 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 		return result, ErrCorrupt
 	}
 	return result, nil
+}
+
+func (s *Store) pathsForChunk(chunkID string) ([]string, []CheckIssue) {
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	var paths []string
+	var issues []CheckIssue
+	for _, inode := range s.meta.Inodes {
+		if inode == nil || inode.State != fileStateActive || inode.Kind != fileKindFile {
+			continue
+		}
+		manifest := s.meta.Manifests[inode.ManifestID]
+		if manifest == nil {
+			continue
+		}
+		matches := false
+		for _, ref := range manifest.Chunks {
+			if ref.ChunkID == chunkID {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		path, err := s.pathForInodeLocked(inode.InodeID)
+		if err != nil {
+			issues = append(issues, CheckIssue{Kind: "inode_parent_invalid", ID: inodeFileID(inode.InodeID), TenantID: inode.TenantID, ChunkID: chunkID, Reason: err.Error()})
+			continue
+		}
+		paths = append(paths, inode.TenantID+"/"+path)
+	}
+	return paths, issues
 }
 
 func (s *Store) checkChunkSnapshot(snap chunkCheckSnapshot) ([]byte, *CheckIssue) {
@@ -291,17 +333,19 @@ func (s *Store) markCorruption(issues []CheckIssue) error {
 	return s.commitMetaLocked(ops)
 }
 
-func (s *Store) pathForInode(id uint64) string {
-	s.metaMu.RLock()
-	defer s.metaMu.RUnlock()
-	return s.pathForInodeLocked(id)
-}
-
-func (s *Store) pathForInodeLocked(id uint64) string {
+func (s *Store) pathForInodeLocked(id uint64) (string, error) {
 	var parts []string
+	seen := map[uint64]bool{}
 	for {
+		if seen[id] {
+			return "", fmt.Errorf("inode parent cycle at inode %d", id)
+		}
+		seen[id] = true
 		inode := s.meta.Inodes[id]
-		if inode == nil || inode.ParentInode == 0 {
+		if inode == nil {
+			return "", fmt.Errorf("inode %d not found", id)
+		}
+		if inode.ParentInode == 0 {
 			break
 		}
 		parts = append(parts, inode.Name)
@@ -310,5 +354,5 @@ func (s *Store) pathForInodeLocked(id uint64) string {
 	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
 		parts[i], parts[j] = parts[j], parts[i]
 	}
-	return strings.Join(parts, "/")
+	return strings.Join(parts, "/"), nil
 }

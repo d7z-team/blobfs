@@ -2,6 +2,8 @@ package blobfs
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"time"
 )
@@ -27,7 +29,11 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 	defer s.endOp()
 	nowTime := time.Now()
 	now := nowTime.UnixNano()
-	segmentDeleteCutoff := now - int64(s.cfg.GC.SegmentDeleteDelay)
+	segmentDeleteDelay := s.cfg.GC.SegmentDeleteDelay
+	if segmentDeleteDelay < 0 {
+		segmentDeleteDelay = 0
+	}
+	segmentDeleteCutoff := now - int64(segmentDeleteDelay)
 	safetyWindow := s.cfg.GC.SafetyWindow
 	if opts.SafetyWindow != 0 {
 		safetyWindow = opts.SafetyWindow
@@ -84,17 +90,11 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 	if len(compactCandidates) > 0 {
 		compacted, err := s.compactCandidates(ctx, compactCandidates)
 		if err != nil {
-			s.rollbackCompaction(compactCandidates)
-			return result, err
+			return result, errors.Join(err, s.rollbackCompaction(compactCandidates))
 		}
 		deleted, err := s.commitCompactionResults(compacted, result, now, segmentDeleteCutoff)
 		if err != nil {
-			for _, item := range compacted {
-				for _, seg := range item.Segments {
-					_ = s.fs.Remove(s.segmentPath(seg))
-				}
-			}
-			s.rollbackCompaction(compactCandidates)
+			err = errors.Join(err, s.removeCompactedSegments(compacted), s.rollbackCompaction(compactCandidates))
 			return result, err
 		}
 		removeSegments = append(removeSegments, deleted...)
@@ -200,8 +200,7 @@ func (s *Store) compactCandidates(ctx context.Context, candidates []compactCandi
 	results := make([]compactResult, 0, len(candidates))
 	for _, candidate := range candidates {
 		if err := contextError(ctx); err != nil {
-			s.removeCompactedSegments(results)
-			return nil, err
+			return nil, errors.Join(err, s.removeCompactedSegments(results))
 		}
 		writer := &segmentBatchWriter{store: s}
 		result := compactResult{Source: candidate.Source}
@@ -209,14 +208,12 @@ func (s *Store) compactCandidates(ctx context.Context, candidates []compactCandi
 			raw, err := s.readChunkPayloadAt(candidate.Source, chunk)
 			if err != nil {
 				writer.cleanup()
-				s.removeCompactedSegments(results)
-				return nil, err
+				return nil, errors.Join(err, s.removeCompactedSegments(results))
 			}
 			next, err := writer.appendChunk(chunk.TenantID, chunk.ChunkID, raw)
 			if err != nil {
 				writer.cleanup()
-				s.removeCompactedSegments(results)
-				return nil, err
+				return nil, errors.Join(err, s.removeCompactedSegments(results))
 			}
 			next.RefCount = chunk.RefCount
 			result.Original = append(result.Original, chunk)
@@ -224,8 +221,7 @@ func (s *Store) compactCandidates(ctx context.Context, candidates []compactCandi
 		}
 		if err := writer.finish(); err != nil {
 			writer.cleanup()
-			s.removeCompactedSegments(results)
-			return nil, err
+			return nil, errors.Join(err, s.removeCompactedSegments(results))
 		}
 		result.Segments = writer.segments
 		results = append(results, result)
@@ -233,12 +229,17 @@ func (s *Store) compactCandidates(ctx context.Context, candidates []compactCandi
 	return results, nil
 }
 
-func (s *Store) removeCompactedSegments(results []compactResult) {
+func (s *Store) removeCompactedSegments(results []compactResult) error {
+	var errs []error
 	for _, item := range results {
 		for _, seg := range item.Segments {
-			_ = s.fs.Remove(s.segmentPath(seg))
+			path := s.segmentPath(seg)
+			if err := s.fs.Remove(path); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("remove compacted segment %s: %w", path, err))
+			}
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func (s *Store) commitCompactionResults(results []compactResult, gcResult *GCResult, now, segmentDeleteCutoff int64) ([]segmentRecord, error) {
@@ -249,9 +250,15 @@ func (s *Store) commitCompactionResults(results []compactResult, gcResult *GCRes
 	for _, item := range results {
 		source := s.meta.Segments[item.Source.SegmentID]
 		if source == nil || source.State != segmentStateCompacting {
+			for _, seg := range item.Segments {
+				deleteSegments = append(deleteSegments, *seg)
+			}
 			continue
 		}
 		if len(item.Original) != len(item.Moved) {
+			rollback := *source
+			rollback.State = segmentStateSealed
+			ops = append(ops, metaOp{Type: "put_segment", Segment: &rollback})
 			for _, seg := range item.Segments {
 				deleteSegments = append(deleteSegments, *seg)
 			}
@@ -310,7 +317,7 @@ func (s *Store) commitCompactionResults(results []compactResult, gcResult *GCRes
 	return deleteSegments, s.commitMetaLocked(ops)
 }
 
-func (s *Store) rollbackCompaction(candidates []compactCandidate) {
+func (s *Store) rollbackCompaction(candidates []compactCandidate) error {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
 	ops := []metaOp{}
@@ -323,7 +330,7 @@ func (s *Store) rollbackCompaction(candidates []compactCandidate) {
 		next.State = segmentStateSealed
 		ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
 	}
-	_ = s.commitMetaLocked(ops)
+	return s.commitMetaLocked(ops)
 }
 
 func (s *Store) collectDeadSegmentsLocked(segmentDeleteCutoff int64) []segmentRecord {

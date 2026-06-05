@@ -42,9 +42,12 @@ func TestLoadMetadataIgnoresTrailingPartialFrame(t *testing.T) {
 		t.Fatalf("write partial frame: %v", err)
 	}
 	_ = log.Close()
-	meta, logName, err := loadMetadata(fsys, metaDir)
+	meta, logName, report, err := loadMetadata(fsys, metaDir)
 	if err != nil {
 		t.Fatalf("load metadata with trailing partial frame: %v", err)
+	}
+	if len(report.ReplayWarnings) != 1 {
+		t.Fatalf("partial frame warning count = %d", len(report.ReplayWarnings))
 	}
 	if logName != metaLogFile {
 		t.Fatalf("log name = %q, want %q", logName, metaLogFile)
@@ -77,7 +80,7 @@ func TestReplayMetaLogRejectsBadChecksum(t *testing.T) {
 		t.Fatalf("write payload: %v", err)
 	}
 	_ = log.Close()
-	if err := replayMetaLog(fsys, logPath, newMetadata()); err == nil {
+	if _, err := replayMetaLog(fsys, logPath, newMetadata()); err == nil {
 		t.Fatal("bad checksum should fail replay")
 	}
 }
