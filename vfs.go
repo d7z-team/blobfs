@@ -42,11 +42,23 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 		return nil, pathError("open", name, err)
 	}
 	writable := flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0
-	if root || path == "" {
+	if root {
 		if writable {
 			return nil, pathError("open", name, fs.ErrInvalid)
 		}
 		return s.openDirFile(name, tenantID, path, root), nil
+	}
+	if path == "" {
+		if writable {
+			return nil, pathError("open", name, fs.ErrInvalid)
+		}
+		s.metaMu.RLock()
+		_, err := s.resolvePathLocked(tenantID, "")
+		s.metaMu.RUnlock()
+		if err != nil {
+			return nil, pathError("open", name, err)
+		}
+		return s.openDirFile(name, tenantID, path, false), nil
 	}
 	info, err := s.vfsNodeInfo(tenantID, path)
 	if err != nil {
@@ -153,8 +165,17 @@ func (s *Store) Mkdir(name string, perm os.FileMode) error {
 	if err != nil {
 		return pathError("mkdir", name, err)
 	}
-	if root || path == "" {
+	if root {
 		return exists("mkdir", name)
+	}
+	if path == "" {
+		s.metaMu.RLock()
+		tenantExists := s.meta.Tenants[tenantID] != 0 && s.activeInodeLocked(s.meta.Tenants[tenantID]) != nil
+		s.metaMu.RUnlock()
+		if tenantExists {
+			return exists("mkdir", name)
+		}
+		return s.ensureTenantRoot(tenantID)
 	}
 	if err := s.ensureTenantRoot(tenantID); err != nil {
 		return err
@@ -424,16 +445,17 @@ func (s *Store) Stat(name string) (os.FileInfo, error) {
 	if root {
 		return blobFileInfo{name: "/", mode: os.ModeDir | 0o755, modTime: time.Now(), isDir: true}, nil
 	}
-	if path == "" {
-		return blobFileInfo{name: tenantID, mode: os.ModeDir | 0o755, modTime: time.Now(), isDir: true}, nil
-	}
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
 	inode, err := s.resolvePathLocked(tenantID, path)
 	if err != nil {
 		return nil, pathError("stat", name, err)
 	}
-	return fileInfoFromInode(inode), nil
+	info := fileInfoFromInode(inode)
+	if path == "" {
+		info.name = tenantID
+	}
+	return info, nil
 }
 
 func (s *Store) Name() string {
@@ -457,11 +479,11 @@ func (s *Store) Chown(name string, uid, gid int) error {
 	})
 }
 
-func (s *Store) Chtimes(name string, _, mtime time.Time) error {
+func (s *Store) Chtimes(name string, atime, mtime time.Time) error {
 	return s.updateVFSMetadata("chtimes", name, func(inode *inodeRecord) {
+		inode.ATime = atime.UnixNano()
 		inode.ModTime = mtime.UnixNano()
 		inode.MTime = inode.ModTime
-		inode.UpdatedAt = inode.ModTime
 	})
 }
 
@@ -474,7 +496,7 @@ func (s *Store) updateVFSMetadata(op, name string, edit func(*inodeRecord)) erro
 	if err != nil {
 		return pathError(op, name, err)
 	}
-	if root || path == "" {
+	if root {
 		return nil
 	}
 	s.metaMu.Lock()
@@ -498,12 +520,13 @@ func (s *Store) openDirFile(name, tenantID, path string, root bool) afero.File {
 	info := blobFileInfo{name: filepath.Base(name), mode: os.ModeDir | 0o755, modTime: time.Now(), isDir: true}
 	if root {
 		info.name = "/"
-	} else if path == "" {
-		info.name = tenantID
 	} else {
 		s.metaMu.RLock()
 		if inode, err := s.resolvePathLocked(tenantID, path); err == nil {
 			info = fileInfoFromInode(inode)
+			if path == "" {
+				info.name = tenantID
+			}
 		}
 		s.metaMu.RUnlock()
 	}

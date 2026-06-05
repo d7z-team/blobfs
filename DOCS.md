@@ -390,7 +390,7 @@ Chtimes
 TenantFS
 ```
 
-普通文件默认清除执行位。设置 `AllowExecutableFiles` 后，VFS 文件可以保留执行位。目录、mtime、uid、gid 存在 BlobFS 元数据中。
+普通文件默认清除执行位。设置 `AllowExecutableFiles` 后，VFS 文件可以保留执行位。目录、atime、mtime、uid、gid 存在 BlobFS 元数据中，tenant root 也使用对应的 root inode 元数据。
 
 `RemoveAll` 的前台语义是 metadata detach：父目录项立即删除，路径立即不可见。子树内 inode、manifest 和 chunk 引用由后续 GC 扫描不可达 inode 后释放，避免在前台请求中递归遍历海量子树。
 

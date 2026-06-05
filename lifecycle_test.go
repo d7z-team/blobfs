@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -269,8 +270,88 @@ func TestCheckpointPrunesDeletedMetadataRecords(t *testing.T) {
 	}
 }
 
+func TestScrubCheckFilesCompletesAfterCloseStarts(t *testing.T) {
+	fsys := &blockingOpenFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.MkdirAll("tenant-a/scrub", 0o755); err != nil {
+		_ = store.Close()
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "scrub/blob", bytes.Repeat([]byte("scrub"), 32))
+
+	fsys.blockOpensTo(".blob")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	scrubDone := make(chan error, 1)
+	go func() {
+		_, err := store.Scrub(ctx, ScrubOptions{CheckFiles: true})
+		scrubDone <- err
+	}()
+	select {
+	case <-fsys.entered:
+	case <-ctx.Done():
+		_ = store.Close()
+		t.Fatalf("scrub did not reach blocked segment read: %v", ctx.Err())
+	}
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- store.Close()
+	}()
+	fsys.releaseBlocked()
+	if err := <-scrubDone; err != nil {
+		t.Fatalf("scrub after close start: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
 func openWriteSessionCount(store *Store) int {
 	store.writeSessionMu.Lock()
 	defer store.writeSessionMu.Unlock()
 	return store.openWriteSessions
+}
+
+type blockingOpenFS struct {
+	afero.Fs
+	mu      sync.Mutex
+	suffix  string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingOpenFS) blockOpensTo(suffix string) {
+	f.mu.Lock()
+	f.suffix = suffix
+	f.entered = make(chan struct{})
+	f.release = make(chan struct{})
+	f.once = sync.Once{}
+	f.mu.Unlock()
+}
+
+func (f *blockingOpenFS) releaseBlocked() {
+	f.mu.Lock()
+	release := f.release
+	f.release = nil
+	f.mu.Unlock()
+	if release != nil {
+		close(release)
+	}
+}
+
+func (f *blockingOpenFS) Open(name string) (afero.File, error) {
+	f.mu.Lock()
+	block := f.suffix != "" && strings.HasSuffix(filepath.ToSlash(name), f.suffix) && f.release != nil
+	entered := f.entered
+	release := f.release
+	f.mu.Unlock()
+	if block {
+		f.once.Do(func() { close(entered) })
+		<-release
+	}
+	return f.Fs.Open(name)
 }

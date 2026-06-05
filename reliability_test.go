@@ -132,6 +132,48 @@ func TestPutReusedChunkSurvivesInterleavedGC(t *testing.T) {
 	}
 }
 
+func TestGCSkipsCorruptUnreferencedChunksWithoutNoopTransaction(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/gc", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "gc/corrupt", []byte("corrupt"))
+	if err := store.DeleteObject(testContext(t), "tenant-a", "gc/corrupt"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	store.metaMu.Lock()
+	var ops []metaOp
+	for _, chunk := range store.meta.Chunks {
+		next := *chunk
+		next.State = chunkStateCorrupt
+		next.CorruptAt = nowUnix()
+		next.CorruptReason = "test corrupt chunk"
+		ops = append(ops, metaOp{Type: "put_chunk", Chunk: &next})
+		break
+	}
+	if len(ops) != 1 {
+		store.metaMu.Unlock()
+		t.Fatal("expected one chunk")
+	}
+	if err := store.commitMetaLocked(ops); err != nil {
+		store.metaMu.Unlock()
+		t.Fatalf("mark corrupt: %v", err)
+	}
+	before := store.meta.TxID
+	store.metaMu.Unlock()
+
+	result, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1})
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	store.metaMu.RLock()
+	txDelta := store.meta.TxID - before
+	store.metaMu.RUnlock()
+	if result.ChunksDeleted != 0 || txDelta != 1 {
+		t.Fatalf("gc wrote unexpected corrupt chunk update: result=%+v txDelta=%d", result, txDelta)
+	}
+}
+
 func TestMaxFileSizeFailureLeavesNoVisibleObjectOrSegments(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxFileSize = 32

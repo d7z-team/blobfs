@@ -23,6 +23,7 @@ type faultFS struct {
 	syncSuffix     string
 	syncFailures   int
 	renameContains string
+	renameSkips    int
 	renameFailures int
 }
 
@@ -41,8 +42,13 @@ func (f *faultFS) failSyncsTo(suffix string, count int) {
 }
 
 func (f *faultFS) failRenamesContaining(fragment string, count int) {
+	f.failRenamesContainingAfter(fragment, 0, count)
+}
+
+func (f *faultFS) failRenamesContainingAfter(fragment string, skip, count int) {
 	f.mu.Lock()
 	f.renameContains = filepath.ToSlash(fragment)
+	f.renameSkips = skip
 	f.renameFailures = count
 	f.mu.Unlock()
 }
@@ -57,9 +63,15 @@ func (f *faultFS) OpenFile(name string, flag int, perm os.FileMode) (afero.File,
 
 func (f *faultFS) Rename(oldname, newname string) error {
 	f.mu.Lock()
-	fail := f.renameFailures > 0 && (strings.Contains(filepath.ToSlash(oldname), f.renameContains) || strings.Contains(filepath.ToSlash(newname), f.renameContains))
-	if fail {
-		f.renameFailures--
+	matches := strings.Contains(filepath.ToSlash(oldname), f.renameContains) || strings.Contains(filepath.ToSlash(newname), f.renameContains)
+	fail := false
+	if matches {
+		if f.renameSkips > 0 {
+			f.renameSkips--
+		} else if f.renameFailures > 0 {
+			f.renameFailures--
+			fail = true
+		}
 	}
 	f.mu.Unlock()
 	if fail {
@@ -222,5 +234,60 @@ func TestSystemFaultSegmentRenameFailureCleansStaging(t *testing.T) {
 	}
 	if files := countRegularFiles(t, fsys, "/blobfs/data/segments"); files != 0 {
 		t.Fatalf("segment files were published despite rename failure, count=%d", files)
+	}
+}
+
+func TestSystemFaultSegmentHeaderWriteFailureCleansStaging(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/faults", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	fsys.failWritesTo(".blob", 1)
+	_, err = store.Put(testContext(t), "tenant-a", "faults/blob", bytes.NewReader([]byte("payload")), nil)
+	if !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("put with segment header fault = %v, want injected fault", err)
+	}
+	if files := countRegularFiles(t, fsys, "/blobfs/data/staging"); files != 0 {
+		t.Fatalf("staging files were not cleaned, count=%d", files)
+	}
+	if files := countRegularFiles(t, fsys, "/blobfs/data/segments"); files != 0 {
+		t.Fatalf("segment files were published despite header failure, count=%d", files)
+	}
+}
+
+func TestSystemFaultLaterSegmentRenameFailureRollsBackPublishedSegments(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	cfg := testConfig()
+	cfg.SegmentSize = 160
+	store, err := OpenFS(fsys, "/blobfs", cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/faults", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	fsys.failRenamesContainingAfter(filepath.Join("data", "segments"), 1, 1)
+	data := make([]byte, 512)
+	for i := range data {
+		data[i] = byte(i*31 + i/7)
+	}
+	_, err = store.Put(testContext(t), "tenant-a", "faults/blob", bytes.NewReader(data), nil)
+	if !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("put with later segment rename fault = %v, want injected fault", err)
+	}
+	if _, err := store.OpenObject(testContext(t), "tenant-a", "faults/blob"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("rename-failed put became visible: %v", err)
+	}
+	if files := countRegularFiles(t, fsys, "/blobfs/data/staging"); files != 0 {
+		t.Fatalf("staging files were not cleaned, count=%d", files)
+	}
+	if files := countRegularFiles(t, fsys, "/blobfs/data/segments"); files != 0 {
+		t.Fatalf("published segment files were not rolled back, count=%d", files)
 	}
 }

@@ -75,6 +75,9 @@ func (f *blobVFSFile) Read(p []byte) (int, error) {
 	if f.isDir {
 		return 0, os.ErrInvalid
 	}
+	if len(p) == 0 {
+		return 0, nil
+	}
 	n, err := f.readAtLocked(p, f.offset)
 	f.offset += int64(n)
 	if errors.Is(err, io.EOF) && n > 0 {
@@ -95,6 +98,9 @@ func (f *blobVFSFile) readAtLocked(p []byte, off int64) (int, error) {
 	}
 	if f.isDir {
 		return 0, os.ErrInvalid
+	}
+	if len(p) == 0 {
+		return 0, nil
 	}
 	if off < 0 {
 		return 0, os.ErrInvalid

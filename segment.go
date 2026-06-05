@@ -124,6 +124,7 @@ func (w *segmentBatchWriter) rotate() error {
 	}
 	if _, err := file.Write([]byte(segmentHeaderMagic)); err != nil {
 		_ = file.Close()
+		_ = w.store.fs.Remove(stagingPath)
 		return err
 	}
 	w.current = &preparedSegment{record: seg, file: file, stagingPath: stagingPath}
@@ -142,6 +143,7 @@ func (w *segmentBatchWriter) finish() error {
 		w.current = nil
 	}
 	sealedAt := nowUnix()
+	published := make([]*segmentRecord, 0, len(w.segments))
 	for _, seg := range w.segments {
 		if seg.SealedAt == 0 {
 			seg.SealedAt = sealedAt
@@ -149,13 +151,22 @@ func (w *segmentBatchWriter) finish() error {
 		staging := w.store.stagingSegmentPath(seg)
 		final := w.store.segmentPath(seg)
 		if err := w.store.fs.MkdirAll(filepath.Dir(final), 0o755); err != nil {
+			w.removePublished(published)
 			return err
 		}
 		if err := w.store.fs.Rename(staging, final); err != nil {
+			w.removePublished(published)
 			return err
 		}
+		published = append(published, seg)
 	}
 	return nil
+}
+
+func (w *segmentBatchWriter) removePublished(segments []*segmentRecord) {
+	for _, seg := range segments {
+		_ = w.store.fs.Remove(w.store.segmentPath(seg))
+	}
 }
 
 func (w *segmentBatchWriter) cleanup() {

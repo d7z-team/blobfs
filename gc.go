@@ -131,6 +131,7 @@ func (s *Store) markUnreferencedChunksLocked(now, cutoff int64, confirmCycles in
 			continue
 		}
 		next := *chunk
+		changed := false
 		switch chunk.State {
 		case chunkStateActive:
 			if confirmCycles <= 1 {
@@ -138,11 +139,13 @@ func (s *Store) markUnreferencedChunksLocked(now, cutoff int64, confirmCycles in
 				next.DeletedAt = now
 				result.ChunksDeleted++
 				result.BytesMadeGarbage += chunk.StoredSize
+				changed = true
 			} else {
 				next.State = chunkStateGarbageCandidate
 				next.GarbageSeenCount = 1
 				next.GarbageCandidateAt = now
 				result.CandidatesMarked++
+				changed = true
 			}
 		case chunkStateGarbageCandidate:
 			if chunk.GarbageSeenCount+1 >= confirmCycles {
@@ -150,12 +153,16 @@ func (s *Store) markUnreferencedChunksLocked(now, cutoff int64, confirmCycles in
 				next.DeletedAt = now
 				result.ChunksDeleted++
 				result.BytesMadeGarbage += chunk.StoredSize
+				changed = true
 			} else {
 				next.GarbageSeenCount++
 				result.CandidatesMarked++
+				changed = true
 			}
 		}
-		*ops = append(*ops, metaOp{Type: "put_chunk", Chunk: &next})
+		if changed {
+			*ops = append(*ops, metaOp{Type: "put_chunk", Chunk: &next})
+		}
 	}
 }
 

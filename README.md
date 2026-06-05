@@ -113,7 +113,7 @@ if err := afero.WriteFile(fs, "tenant-a/docs/file.txt", []byte("hello"), 0o644);
 }
 ```
 
-Directory records, mode, mtime, uid, and gid are stored in BlobFS metadata.
+Directory records, mode, atime, mtime, uid, and gid are stored in BlobFS metadata.
 
 Directories are explicit; BlobFS does not synthesize missing parents from object names. Writable VFS handles commit through temporary write sessions, enforces `MaxOpenWriteSessions`, and fails with `ErrConflict` if the file generation changed while the handle was open.
 

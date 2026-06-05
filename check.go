@@ -28,6 +28,13 @@ func (s *Store) CheckObject(ctx context.Context, tenantID, path string) (*CheckR
 		return nil, err
 	}
 	defer s.endOp()
+	return s.checkObject(ctx, tenantID, path)
+}
+
+func (s *Store) checkObject(ctx context.Context, tenantID, path string) (*CheckResult, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	if err := validateTenantID(tenantID, s.cfg); err != nil {
 		return nil, pathError("check", tenantID, err)
 	}
@@ -192,7 +199,7 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 	}
 	for _, file := range files {
 		path := s.pathForInode(file.InodeID)
-		check, err := s.CheckObject(ctx, file.TenantID, path)
+		check, err := s.checkObject(ctx, file.TenantID, path)
 		result.CheckedFiles++
 		if err != nil && !errors.Is(err, ErrCorrupt) {
 			return result, err

@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/afero"
 )
@@ -201,6 +202,19 @@ func TestHotObjectReaderAndVFSFileBoundaries(t *testing.T) {
 	if got := readTestBytes(t, store, "tenant-a", "hot/vfs.txt"); string(got) != "aZ!?" {
 		t.Fatalf("append content = %q", got)
 	}
+	readFile, err := store.OpenFile("tenant-a/hot/vfs.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("open read file: %v", err)
+	}
+	if n, err := readFile.Read(nil); n != 0 || err != nil {
+		_ = readFile.Close()
+		t.Fatalf("zero vfs read = %d, %v", n, err)
+	}
+	if n, err := readFile.ReadAt(nil, 99); n != 0 || err != nil {
+		_ = readFile.Close()
+		t.Fatalf("zero vfs readat past eof = %d, %v", n, err)
+	}
+	_ = readFile.Close()
 
 	dir, err := store.Open("tenant-a/hot")
 	if err != nil {
@@ -227,6 +241,46 @@ func TestHotObjectReaderAndVFSFileBoundaries(t *testing.T) {
 	}
 	if _, err := dir.Readdir(1); !errors.Is(err, afero.ErrFileClosed) {
 		t.Fatalf("closed dir readdir = %v", err)
+	}
+}
+
+func TestVFSTenantRootExistsAndKeepsMetadata(t *testing.T) {
+	store := openTestStore(t)
+	if _, err := store.Open("tenant-missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("open missing tenant root = %v, want not exist", err)
+	}
+	if _, err := store.Stat("tenant-missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stat missing tenant root = %v, want not exist", err)
+	}
+	if _, err := store.TenantFS("tenant-missing").Open("."); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("tenant fs missing root = %v, want not exist", err)
+	}
+	if err := store.Mkdir("tenant-root", 0o750); err != nil {
+		t.Fatalf("mkdir tenant root: %v", err)
+	}
+	if err := store.Mkdir("tenant-root", 0o750); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("mkdir existing tenant root = %v, want exist", err)
+	}
+	mtime := time.Unix(456, 0)
+	atime := time.Unix(123, 0)
+	if err := store.Chmod("tenant-root", 0o700); err != nil {
+		t.Fatalf("chmod tenant root: %v", err)
+	}
+	if err := store.Chtimes("tenant-root", atime, mtime); err != nil {
+		t.Fatalf("chtimes tenant root: %v", err)
+	}
+	stat, err := store.Stat("tenant-root")
+	if err != nil {
+		t.Fatalf("stat tenant root: %v", err)
+	}
+	if stat.Name() != "tenant-root" || !stat.IsDir() || stat.Mode().Perm() != 0o700 || !stat.ModTime().Equal(mtime) {
+		t.Fatalf("bad tenant root stat: name=%q dir=%v mode=%v mtime=%v", stat.Name(), stat.IsDir(), stat.Mode(), stat.ModTime())
+	}
+	store.metaMu.RLock()
+	root := store.meta.Inodes[store.meta.Tenants["tenant-root"]]
+	store.metaMu.RUnlock()
+	if root == nil || root.ATime != atime.UnixNano() {
+		t.Fatalf("tenant root atime not stored: %+v", root)
 	}
 }
 
