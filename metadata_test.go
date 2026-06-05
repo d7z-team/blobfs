@@ -42,9 +42,12 @@ func TestLoadMetadataIgnoresTrailingPartialFrame(t *testing.T) {
 		t.Fatalf("write partial frame: %v", err)
 	}
 	_ = log.Close()
-	meta, err := loadMetadata(fsys, metaDir)
+	meta, logName, err := loadMetadata(fsys, metaDir)
 	if err != nil {
 		t.Fatalf("load metadata with trailing partial frame: %v", err)
+	}
+	if logName != metaLogFile {
+		t.Fatalf("log name = %q, want %q", logName, metaLogFile)
 	}
 	if meta.Tenants["tenant-a"] != root.InodeID || meta.TxID != 1 {
 		t.Fatalf("metadata was not replayed: %+v", meta)
@@ -85,5 +88,25 @@ func TestRecoverInProgressMetadataResetsCompactingSegments(t *testing.T) {
 	recoverInProgressMetadata(meta)
 	if meta.Segments["0000000000000001"].State != segmentStateSealed {
 		t.Fatalf("compacting segment was not recovered: %+v", meta.Segments["0000000000000001"])
+	}
+}
+
+func TestGCHistoryKeepsTotalAndBoundsRecentRuns(t *testing.T) {
+	meta := newMetadata()
+	total := maxRecentGCRuns + 17
+	for i := 1; i <= total; i++ {
+		applyMetaTx(meta, metaTx{TxID: uint64(i), Ops: []metaOp{{Type: "append_gcrun", GCRun: &gcRun{Epoch: int64(i), State: "DONE"}}}})
+	}
+	if meta.GC.TotalRuns != int64(total) {
+		t.Fatalf("total runs = %d, want %d", meta.GC.TotalRuns, total)
+	}
+	if meta.GC.LastEpoch != int64(total) {
+		t.Fatalf("last epoch = %d, want %d", meta.GC.LastEpoch, total)
+	}
+	if len(meta.GC.Recent) != maxRecentGCRuns {
+		t.Fatalf("recent runs = %d, want %d", len(meta.GC.Recent), maxRecentGCRuns)
+	}
+	if meta.GC.Recent[0].Epoch != int64(total-maxRecentGCRuns+1) {
+		t.Fatalf("first retained epoch = %d", meta.GC.Recent[0].Epoch)
 	}
 }

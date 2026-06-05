@@ -66,6 +66,7 @@ base/
     checkpoint.json
     txlog/
       000001.log
+      000002.log
   data/
     segments/
       0000/
@@ -108,7 +109,7 @@ payload
 meta/SUPER0
 meta/SUPER1
 meta/checkpoint.json
-meta/txlog/000001.log
+meta/txlog/<active-generation>.log
 ```
 
 核心记录：
@@ -197,7 +198,9 @@ segment:   SEALED, COMPACTING, DELETED, CORRUPT
 
 目录是显式 inode/dentry 记录。BlobFS 不从 `a/b.txt` 自动合成 `a`，所以写入嵌套 object 前必须先创建父目录。目录列表只依赖 `dir_entries`，不扫描全量文件名。目录 rename 移动的是父目录项和目录 inode，不扫描或改写子树。
 
-`checkpoint.json` 是周期性 checkpoint，用来压缩 `txlog/000001.log` 并限制启动 replay 成本。事务先写入 txlog 并 fsync；checkpoint 是后续压缩，不改变已提交事务的可见性。
+`checkpoint.json` 是周期性 checkpoint，用来压缩 metadata 并限制启动 replay 成本。事务先写入当前 txlog 并 fsync；checkpoint 成功后写入紧凑 snapshot，创建并同步新一代空 txlog，再通过 `SUPER0`/`SUPER1` 切换活动 log。旧 log 只在切换成功后关闭和删除，因此 checkpoint 失败不会破坏仍可继续提交的旧 txlog。
+
+checkpoint 会裁剪不再需要的 deleted inode、manifest、chunk、segment 记录。GC 历史保存总运行次数、最后 epoch 和最近窗口，避免长期后台 GC 让 checkpoint JSON 单调膨胀。
 
 ## 写入
 
@@ -223,7 +226,7 @@ staging segment payload -> visible segment -> metadata txlog -> inode visible
 VFS 写入使用临时 write session：
 
 ```text
-OpenFile writable
+OpenFile/OpenFileContext writable
   -> 创建 data/staging/sessions/session-*.tmp
   -> 受 MaxOpenWriteSessions 限制，避免无限临时写会话放大
   -> 复制旧内容或从空文件开始
@@ -231,7 +234,7 @@ OpenFile writable
   -> File.Sync 或 Close 执行一次带 base generation 的提交
 ```
 
-如果打开句柄后同一路径被其他写入修改，提交会返回 `ErrConflict`。新建句柄在关闭前如果同路径已经被创建，也会返回 `ErrConflict`。
+如果打开句柄后同一路径被其他写入修改，提交会返回 `ErrConflict`。新建句柄在关闭前如果同路径已经被创建，也会返回 `ErrConflict`。`OpenFileContext` 提供最薄的可取消 VFS 写接口：传入的 context 会用于打开阶段读取旧内容，以及之后的 `Sync`/`Close` 提交。
 
 ## 读取
 
@@ -332,7 +335,9 @@ Repair(ctx, opts)
 
 `Health` 做轻量检查，用于判断 store 是否 open、metadata 是否加载、txlog 和数据目录是否可用、是否存在 corrupt 或 compacting 状态。它不扫描所有 segment。
 
-`Stats` 只从内存 metadata 聚合租户、inode、manifest、chunk、segment、字节和 GC 计数，不触发磁盘扫描。
+`Health` 会在 metadata 锁下读取 txlog 和 checkpoint 状态；checkpoint 持久化失败会报告 `DEGRADED`，但只要 txlog 仍可写，不会误报为只读。
+
+`Stats` 只从内存 metadata 聚合租户、inode、manifest、chunk、segment、字节和 GC 计数，不触发磁盘扫描。GC 计数是总次数和最后 epoch，不依赖无限增长的历史数组。
 
 `Diagnose` 默认无副作用，可按选项扫描：
 
@@ -354,6 +359,8 @@ MarkMissingCorrupt: segment 文件缺失时标记相关 segment/chunk 为 CORRUP
 
 高风险动作不在 `Repair` 中自动执行：不截断 txlog、不重建 manifest、不猜测缺失 chunk 内容。异常退出残留的 `LOCK` 会阻止 reopen；确认没有存活进程持有该 store 后，可显式调用 `RemoveStaleLock(baseDir)` 或 `RemoveFSStaleLock(fs, baseDir)` 删除 stale lock。
 
+`Close` 会先停止后台 GC、等待已进入的写入/GC/修复操作结束，再 checkpoint 并关闭 metadata log，避免后台 goroutine 在 txlog 关闭后继续写入。
+
 ## VFS
 
 `*Store` 实现 `afero.Fs`，同时提供 `TenantFS(tenantID) fs.FS`。
@@ -370,6 +377,7 @@ VFS 支持：
 Create
 Open
 OpenFile
+OpenFileContext
 Mkdir
 MkdirAll
 Remove

@@ -233,6 +233,12 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 	report.Checks = append(report.Checks, HealthCheck{Name: "store_open", OK: true, Message: "store is open"})
 	s.metaMu.RLock()
 	metaLoaded := s.meta != nil
+	txlogOK := s.metaLog != nil
+	checkpointOK := s.lastCheckpointErr == nil
+	checkpointMessage := "checkpoint is healthy"
+	if s.lastCheckpointErr != nil {
+		checkpointMessage = s.lastCheckpointErr.Error()
+	}
 	hasCorruptChunks := false
 	hasCorruptSegments := false
 	hasCompactingSegments := false
@@ -254,8 +260,8 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 	}
 	s.metaMu.RUnlock()
 	report.Checks = append(report.Checks, HealthCheck{Name: "metadata_loaded", OK: metaLoaded, Message: healthMessage(metaLoaded, "metadata loaded", "metadata is nil")})
-	txlogOK := s.metaLog != nil
 	report.Checks = append(report.Checks, HealthCheck{Name: "txlog_available", OK: txlogOK, Message: healthMessage(txlogOK, "metadata log is open", "metadata log is unavailable")})
+	report.Checks = append(report.Checks, HealthCheck{Name: "checkpoint_healthy", OK: checkpointOK, Message: checkpointMessage})
 	segmentsOK := s.pathAccessible(s.segmentsDir)
 	report.Checks = append(report.Checks, HealthCheck{Name: "segments_dir_available", OK: segmentsOK, Message: healthMessage(segmentsOK, "segments directory is accessible", "segments directory is not accessible")})
 	stagingOK := s.pathAccessible(s.stagingDir)
@@ -282,7 +288,7 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		report.Writable = false
 		return report, nil
 	}
-	if hasCompactingSegments {
+	if !checkpointOK || hasCompactingSegments {
 		report.State = HealthDegraded
 	}
 	return report, nil
@@ -343,12 +349,8 @@ func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
 			stats.Segments.Sealed++
 		}
 	}
-	stats.GC.Runs = len(s.meta.GCRuns)
-	for _, run := range s.meta.GCRuns {
-		if run.Epoch > stats.GC.LastEpoch {
-			stats.GC.LastEpoch = run.Epoch
-		}
-	}
+	stats.GC.Runs = int(s.meta.GC.TotalRuns)
+	stats.GC.LastEpoch = s.meta.GC.LastEpoch
 	return stats, nil
 }
 
@@ -442,9 +444,10 @@ func (s *Store) Diagnose(ctx context.Context, opts DiagnoseOptions) (*DiagnoseRe
 
 // Repair applies or previews low-risk recovery actions selected by RepairOptions.
 func (s *Store) Repair(ctx context.Context, opts RepairOptions) (*RepairReport, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	dryRun := opts.DryRun || !opts.Apply
 	report := &RepairReport{DryRun: dryRun, GeneratedAt: time.Now()}
 	addAction := func(action RepairAction) bool {

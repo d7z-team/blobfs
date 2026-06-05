@@ -28,6 +28,15 @@ func (s *Store) Open(name string) (afero.File, error) {
 }
 
 func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
+	return s.OpenFileContext(s.ctx, name, flag, perm)
+}
+
+// OpenFileContext opens a VFS file and uses ctx for reads needed during open and for later Sync/Close commits.
+func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm os.FileMode) (afero.File, error) {
+	if err := s.beginOp(ctx); err != nil {
+		return nil, err
+	}
+	defer s.endOp()
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return nil, pathError("open", name, err)
@@ -37,7 +46,7 @@ func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 		if writable {
 			return nil, pathError("open", name, fs.ErrInvalid)
 		}
-		return s.openDirFile(name, tenantID, path, root)
+		return s.openDirFile(name, tenantID, path, root), nil
 	}
 	info, err := s.vfsNodeInfo(tenantID, path)
 	if err != nil {
@@ -58,14 +67,14 @@ func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 			if writable {
 				return nil, pathError("open", name, ErrIsDir)
 			}
-			return s.openDirFile(name, tenantID, path, false)
+			return s.openDirFile(name, tenantID, path, false), nil
 		}
 		if flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0 {
 			return nil, exists("open", name)
 		}
 	}
 	if !writable {
-		reader, err := s.OpenObject(context.Background(), tenantID, path)
+		reader, err := s.OpenObject(ctx, tenantID, path)
 		if err != nil {
 			return nil, err
 		}
@@ -98,7 +107,7 @@ func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 		mode = s.regularFileMode(info.mode)
 		modTime = info.modTime
 		if flag&os.O_TRUNC == 0 {
-			reader, err := s.OpenObject(context.Background(), tenantID, path)
+			reader, err := s.OpenObject(ctx, tenantID, path)
 			if err != nil {
 				cleanupSession()
 				return nil, err
@@ -117,6 +126,7 @@ func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 	}
 	return &blobVFSFile{
 		store:          s,
+		ctx:            ctx,
 		name:           name,
 		tenantID:       tenantID,
 		path:           path,
@@ -135,6 +145,10 @@ func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, e
 }
 
 func (s *Store) Mkdir(name string, perm os.FileMode) error {
+	if err := s.beginOp(s.ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return pathError("mkdir", name, err)
@@ -179,6 +193,10 @@ func (s *Store) Mkdir(name string, perm os.FileMode) error {
 }
 
 func (s *Store) MkdirAll(name string, perm os.FileMode) error {
+	if err := s.beginOp(s.ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return pathError("mkdir", name, err)
@@ -243,6 +261,10 @@ func (s *Store) MkdirAll(name string, perm os.FileMode) error {
 }
 
 func (s *Store) Remove(name string) error {
+	if err := s.beginOp(s.ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return pathError("remove", name, err)
@@ -278,6 +300,10 @@ func (s *Store) Remove(name string) error {
 }
 
 func (s *Store) RemoveAll(name string) error {
+	if err := s.beginOp(s.ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return pathError("remove", name, err)
@@ -313,6 +339,10 @@ func (s *Store) RemoveAll(name string) error {
 }
 
 func (s *Store) Rename(oldname, newname string) error {
+	if err := s.beginOp(s.ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
 	oldTenant, oldPath, oldRoot, err := s.splitVFSPath(oldname)
 	if err != nil {
 		return pathError("rename", oldname, err)
@@ -436,6 +466,10 @@ func (s *Store) Chtimes(name string, _, mtime time.Time) error {
 }
 
 func (s *Store) updateVFSMetadata(op, name string, edit func(*inodeRecord)) error {
+	if err := s.beginOp(s.ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
 		return pathError(op, name, err)
@@ -459,7 +493,7 @@ func (s *Store) updateVFSMetadata(op, name string, edit func(*inodeRecord)) erro
 	return s.commitMetaLocked([]metaOp{{Type: "put_inode", Inode: next}})
 }
 
-func (s *Store) openDirFile(name, tenantID, path string, root bool) (afero.File, error) {
+func (s *Store) openDirFile(name, tenantID, path string, root bool) afero.File {
 	entries := s.listDir(tenantID, path, root)
 	info := blobFileInfo{name: filepath.Base(name), mode: os.ModeDir | 0o755, modTime: time.Now(), isDir: true}
 	if root {
@@ -473,7 +507,7 @@ func (s *Store) openDirFile(name, tenantID, path string, root bool) (afero.File,
 		}
 		s.metaMu.RUnlock()
 	}
-	return &blobVFSFile{name: name, mode: info.mode, modTime: info.modTime, isDir: true, entries: entries}, nil
+	return &blobVFSFile{name: name, mode: info.mode, modTime: info.modTime, isDir: true, entries: entries}
 }
 
 func (s *Store) listDir(tenantID, path string, root bool) []os.FileInfo {

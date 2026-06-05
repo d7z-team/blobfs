@@ -681,10 +681,17 @@ func TestCheckpointCompactsMetadataLogAndRecovers(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "meta", metaCheckpointFile)); err != nil {
 		t.Fatalf("checkpoint missing: %v", err)
 	}
-	if stat, err := os.Stat(filepath.Join(dir, "meta", "txlog", metaLogFile)); err != nil {
-		t.Fatalf("txlog missing: %v", err)
+	super, err := loadMetaSuperBlock(afero.NewOsFs(), filepath.Join(dir, "meta"))
+	if err != nil {
+		t.Fatalf("load superblock: %v", err)
+	}
+	if super.LogFile == metaLogFile {
+		t.Fatalf("active txlog should rotate after checkpoint, still %q", super.LogFile)
+	}
+	if stat, err := os.Stat(filepath.Join(dir, "meta", "txlog", super.LogFile)); err != nil {
+		t.Fatalf("active txlog missing: %v", err)
 	} else if stat.Size() != 0 {
-		t.Fatalf("txlog should be compacted after close, size=%d", stat.Size())
+		t.Fatalf("active txlog should be empty after close checkpoint, size=%d", stat.Size())
 	}
 	reopened, err := Open(dir, testConfig())
 	if err != nil {

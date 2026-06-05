@@ -4,10 +4,12 @@ import (
 	"errors"
 	"io"
 	"sort"
+	"sync"
 )
 
 // ObjectReader reads an immutable snapshot of a file's manifest and chunks.
 type ObjectReader struct {
+	mu             sync.Mutex
 	store          *Store
 	size           int64
 	offset         int64
@@ -102,6 +104,8 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 }
 
 func (r *ObjectReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		return 0, errors.New("reader is closed")
 	}
@@ -141,6 +145,8 @@ func (r *ObjectReader) Read(p []byte) (int, error) {
 }
 
 func (r *ObjectReader) Seek(offset int64, whence int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		return 0, errors.New("reader is closed")
 	}
@@ -166,14 +172,19 @@ func (r *ObjectReader) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (r *ObjectReader) Close() error {
-	if !r.closed {
-		for _, segmentID := range r.pinnedSegments {
-			r.store.unpinSegment(segmentID)
-		}
-		r.pinnedSegments = nil
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
 	}
 	r.closed = true
+	pinned := r.pinnedSegments
+	r.pinnedSegments = nil
 	r.buf = nil
+	r.mu.Unlock()
+	for _, segmentID := range pinned {
+		r.store.unpinSegment(segmentID)
+	}
 	return nil
 }
 

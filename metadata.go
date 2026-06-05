@@ -4,11 +4,13 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/afero"
@@ -44,6 +46,7 @@ const (
 	metaCheckpointFile     = "checkpoint.json"
 	metaCheckpointInterval = 128
 	metaFrameMagic         = uint32(0x324d4642)
+	maxRecentGCRuns        = 1024
 )
 
 type inodeRecord struct {
@@ -140,6 +143,12 @@ type gcRun struct {
 	Notes        string `json:"notes,omitempty"`
 }
 
+type gcMetadata struct {
+	TotalRuns int64   `json:"total_runs"`
+	LastEpoch int64   `json:"last_epoch"`
+	Recent    []gcRun `json:"recent,omitempty"`
+}
+
 type metadata struct {
 	Version        int                          `json:"version"`
 	TxID           uint64                       `json:"txid"`
@@ -152,7 +161,7 @@ type metadata struct {
 	Manifests      map[string]*manifestRecord   `json:"manifests"`
 	Chunks         map[string]*chunkRecord      `json:"chunks"`
 	Segments       map[string]*segmentRecord    `json:"segments"`
-	GCRuns         []gcRun                      `json:"gc_runs,omitempty"`
+	GC             gcMetadata                   `json:"gc,omitempty"`
 }
 
 type metaTx struct {
@@ -195,20 +204,28 @@ func newMetadata() *metadata {
 	}
 }
 
-func loadMetadata(fs afero.Fs, metaDir string) (*metadata, error) {
+func loadMetadata(fs afero.Fs, metaDir string) (*metadata, string, error) {
 	meta := newMetadata()
 	if err := fs.MkdirAll(filepath.Join(metaDir, "txlog"), 0o755); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := loadMetaCheckpoint(fs, filepath.Join(metaDir, metaCheckpointFile), meta); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	if err := replayMetaLog(fs, filepath.Join(metaDir, "txlog", metaLogFile), meta); err != nil {
-		return nil, err
+	super, err := loadMetaSuperBlock(fs, metaDir)
+	if err != nil {
+		return nil, "", err
+	}
+	logFile := super.LogFile
+	if logFile == "" {
+		logFile = metaLogFile
+	}
+	if err := replayMetaLog(fs, filepath.Join(metaDir, "txlog", logFile), meta); err != nil {
+		return nil, "", err
 	}
 	recoverInProgressMetadata(meta)
 	recomputeMetaCounters(meta)
-	return meta, nil
+	return meta, logFile, nil
 }
 
 func loadMetaCheckpoint(fs afero.Fs, path string, meta *metadata) error {
@@ -273,6 +290,9 @@ func replayMetaLog(fs afero.Fs, path string, meta *metadata) error {
 }
 
 func writeMetaTx(file afero.File, tx metaTx) error {
+	if file == nil {
+		return errors.New("metadata log is not open")
+	}
 	payload, err := json.Marshal(tx)
 	if err != nil {
 		return err
@@ -339,7 +359,12 @@ func applyMetaOp(meta *metadata, op metaOp) {
 		}
 	case "append_gcrun":
 		if op.GCRun != nil {
-			meta.GCRuns = append(meta.GCRuns, *op.GCRun)
+			meta.GC.TotalRuns++
+			if op.GCRun.Epoch > meta.GC.LastEpoch {
+				meta.GC.LastEpoch = op.GCRun.Epoch
+			}
+			meta.GC.Recent = append(meta.GC.Recent, *op.GCRun)
+			trimRecentGCRuns(meta)
 		}
 	}
 }
@@ -368,11 +393,21 @@ func recomputeMetaCounters(meta *metadata) {
 			meta.NextSegmentSeq = seq + 1
 		}
 	}
-	for _, run := range meta.GCRuns {
+	if meta.GC.TotalRuns < int64(len(meta.GC.Recent)) {
+		meta.GC.TotalRuns = int64(len(meta.GC.Recent))
+	}
+	for _, run := range meta.GC.Recent {
 		if run.Epoch >= meta.NextGCEpoch {
 			meta.NextGCEpoch = run.Epoch + 1
 		}
+		if run.Epoch > meta.GC.LastEpoch {
+			meta.GC.LastEpoch = run.Epoch
+		}
 	}
+	if meta.GC.LastEpoch >= meta.NextGCEpoch {
+		meta.NextGCEpoch = meta.GC.LastEpoch + 1
+	}
+	trimRecentGCRuns(meta)
 }
 
 func ensureMetaMaps(meta *metadata) {
@@ -412,11 +447,71 @@ func saveMetaCheckpoint(fs afero.Fs, metaDir string, meta *metadata) error {
 	return writeFileAtomicSync(fs, filepath.Join(metaDir, metaCheckpointFile), data, 0o600)
 }
 
-func saveSuperBlock(fs afero.Fs, metaDir string, txid uint64) error {
+func loadMetaSuperBlock(fs afero.Fs, metaDir string) (metaSuperBlock, error) {
+	var best metaSuperBlock
+	var haveValid bool
+	var firstInvalid error
+	for _, name := range []string{"SUPER0", "SUPER1"} {
+		data, err := afero.ReadFile(fs, filepath.Join(metaDir, name))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return metaSuperBlock{}, err
+		}
+		super, err := decodeMetaSuperBlock(data)
+		if err != nil {
+			if firstInvalid == nil {
+				firstInvalid = err
+			}
+			continue
+		}
+		if !haveValid || super.CheckpointTxID >= best.CheckpointTxID {
+			best = super
+			haveValid = true
+		}
+	}
+	if haveValid {
+		return best, nil
+	}
+	if firstInvalid != nil {
+		return metaSuperBlock{}, firstInvalid
+	}
+	return metaSuperBlock{FormatVersion: metaFormatVersion, LogFile: metaLogFile}, nil
+}
+
+func decodeMetaSuperBlock(data []byte) (metaSuperBlock, error) {
+	var super metaSuperBlock
+	if err := json.Unmarshal(data, &super); err != nil {
+		return metaSuperBlock{}, err
+	}
+	if super.FormatVersion != metaFormatVersion {
+		return metaSuperBlock{}, errors.New("unsupported metadata superblock version")
+	}
+	if super.LogFile == "" || filepath.Base(super.LogFile) != super.LogFile || !strings.HasSuffix(super.LogFile, ".log") {
+		return metaSuperBlock{}, errors.New("invalid metadata superblock log file")
+	}
+	wantCRC := super.CRC
+	super.CRC = 0
+	payload, err := json.Marshal(super)
+	if err != nil {
+		return metaSuperBlock{}, err
+	}
+	if crc32.ChecksumIEEE(payload) != wantCRC {
+		return metaSuperBlock{}, errors.New("metadata superblock checksum mismatch")
+	}
+	super.CRC = wantCRC
+	return super, nil
+}
+
+func saveSuperBlock(fs afero.Fs, metaDir string, txid uint64, logFile string) error {
+	if logFile == "" || filepath.Base(logFile) != logFile || !strings.HasSuffix(logFile, ".log") {
+		return errors.New("invalid metadata log file")
+	}
 	super := metaSuperBlock{
 		FormatVersion:  metaFormatVersion,
 		CheckpointTxID: txid,
-		LogFile:        metaLogFile,
+		LogFile:        logFile,
 	}
 	payload, err := json.Marshal(super)
 	if err != nil {
@@ -432,6 +527,90 @@ func saveSuperBlock(fs afero.Fs, metaDir string, txid uint64) error {
 		name = "SUPER1"
 	}
 	return writeFileSync(fs, filepath.Join(metaDir, name), payload, 0o600)
+}
+
+func nextMetaLogName(current string) string {
+	if current == "" {
+		return metaLogFile
+	}
+	base := strings.TrimSuffix(current, ".log")
+	n, err := strconv.Atoi(base)
+	if err != nil || n < 1 {
+		return metaLogFile
+	}
+	return fmt.Sprintf("%06d.log", n+1)
+}
+
+func trimRecentGCRuns(meta *metadata) {
+	if len(meta.GC.Recent) > maxRecentGCRuns {
+		meta.GC.Recent = append([]gcRun(nil), meta.GC.Recent[len(meta.GC.Recent)-maxRecentGCRuns:]...)
+	}
+}
+
+func compactMetadata(meta *metadata) {
+	ensureMetaMaps(meta)
+	for parentID := range meta.DirEntries {
+		inode := meta.Inodes[parentID]
+		if inode == nil || inode.State != fileStateActive || inode.Kind != fileKindDir {
+			delete(meta.DirEntries, parentID)
+		}
+	}
+
+	referencedInodes := map[uint64]bool{}
+	for _, rootID := range meta.Tenants {
+		if rootID != 0 {
+			referencedInodes[rootID] = true
+		}
+	}
+	for _, entries := range meta.DirEntries {
+		for _, childID := range entries {
+			if childID != 0 {
+				referencedInodes[childID] = true
+			}
+		}
+	}
+	for id, inode := range meta.Inodes {
+		if inode == nil || (inode.State == fileStateDeleted && !referencedInodes[id]) {
+			delete(meta.Inodes, id)
+		}
+	}
+
+	activeManifestRefs := map[string]bool{}
+	for _, inode := range meta.Inodes {
+		if inode != nil && inode.State == fileStateActive && inode.Kind == fileKindFile && inode.ManifestID != "" {
+			activeManifestRefs[inode.ManifestID] = true
+		}
+	}
+	for id, manifest := range meta.Manifests {
+		if manifest == nil || (manifest.State == manifestStateDeleted && manifest.RefCount <= 0 && !activeManifestRefs[id]) {
+			delete(meta.Manifests, id)
+		}
+	}
+
+	for id, chunk := range meta.Chunks {
+		if chunk == nil {
+			delete(meta.Chunks, id)
+			continue
+		}
+		if chunk.State == chunkStateDeleted && chunk.RefCount <= 0 {
+			seg := meta.Segments[chunk.SegmentID]
+			if seg == nil || seg.State == segmentStateDeleted {
+				delete(meta.Chunks, id)
+			}
+		}
+	}
+	segmentRefs := map[string]bool{}
+	for _, chunk := range meta.Chunks {
+		if chunk != nil && chunk.SegmentID != "" {
+			segmentRefs[chunk.SegmentID] = true
+		}
+	}
+	for id, seg := range meta.Segments {
+		if seg == nil || (seg.State == segmentStateDeleted && !segmentRefs[id]) {
+			delete(meta.Segments, id)
+		}
+	}
+	trimRecentGCRuns(meta)
 }
 
 func writeFileSync(fs afero.Fs, path string, data []byte, perm os.FileMode) error {

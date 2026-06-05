@@ -24,9 +24,10 @@ type chunkCheckSnapshot struct {
 
 // CheckObject verifies one active object from metadata references through chunk and file hashes.
 func (s *Store) CheckObject(ctx context.Context, tenantID, path string) (*CheckResult, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	if err := validateTenantID(tenantID, s.cfg); err != nil {
 		return nil, pathError("check", tenantID, err)
 	}
@@ -118,9 +119,10 @@ func (s *Store) checkSnapshots(tenantID, path string) ([]chunkCheckSnapshot, str
 
 // Scrub verifies stored chunks and optionally active file hashes across the whole store.
 func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	s.metaMu.RLock()
 	snapshots := make([]chunkCheckSnapshot, 0, len(s.meta.Chunks))
 	affected := map[string][]string{}

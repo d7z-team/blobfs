@@ -19,6 +19,7 @@ BlobFS is a local content-addressed file storage library for Go. It stores files
 - Object and store integrity checks.
 - Explicit directory records with directory indexes.
 - Generation-checked VFS writes to avoid silent lost updates.
+- Context-aware VFS commits through `OpenFileContext`.
 - `afero.Fs` and tenant-rooted `io/fs` support.
 - Regular file modes clear executable bits by default.
 
@@ -116,6 +117,8 @@ Directory records, mode, mtime, uid, and gid are stored in BlobFS metadata.
 
 Directories are explicit; BlobFS does not synthesize missing parents from object names. Writable VFS handles commit through temporary write sessions, enforces `MaxOpenWriteSessions`, and fails with `ErrConflict` if the file generation changed while the handle was open.
 
+Use `OpenFileContext` when a writable VFS handle needs caller-controlled cancellation for later `Sync` or `Close` commits. Plain `OpenFile` uses the store lifecycle context.
+
 ## Standard Library FS
 
 Use `TenantFS` when a consumer expects `io/fs.FS`:
@@ -140,7 +143,7 @@ err = blobfs.RemoveStaleLock("./data/blobfs") // only after confirming no live p
 
 Reads verify segment records, payload checksums, decompressed sizes, and chunk hashes before returning bytes. Integrity checks additionally verify manifest references, chunk metadata, and file hashes. Corrupt chunks and segments are marked `CORRUPT` and are not reused for reads or deduplication.
 
-`Health` and `Stats` are lightweight metadata-oriented APIs. `Diagnose` can optionally scan segment and staging directories. `Repair` only performs low-risk actions selected by `RepairOptions`; it defaults to dry-run and executes only when `Apply` is true. `RemoveStaleLock` is a standalone crash-recovery helper and must only be called after external ownership checks.
+`Health` and `Stats` are lightweight metadata-oriented APIs. `Health` also reports checkpoint/log health; `Stats` keeps total GC runs plus a bounded recent history internally. `Diagnose` can optionally scan segment and staging directories. `Repair` only performs low-risk actions selected by `RepairOptions`; it defaults to dry-run and executes only when `Apply` is true. `RemoveStaleLock` is a standalone crash-recovery helper and must only be called after external ownership checks.
 
 ## Configuration
 
@@ -181,6 +184,7 @@ base/
     checkpoint.json
     txlog/
       000001.log
+      000002.log
   data/
     segments/
       0000/
@@ -190,14 +194,15 @@ base/
     staging/
 ```
 
-Metadata is persisted as typed inode/dentry transactions in an append-only metadata log. Periodic checkpoints compact the log for bounded startup replay. Segment files are numeric `.blob` files and object data is staged before metadata makes it visible.
+Metadata is persisted as typed inode/dentry transactions in an append-only metadata log. `SUPER0`/`SUPER1` select the active log generation. Periodic checkpoints write a compacted metadata snapshot, switch to a new empty log, and prune obsolete deleted metadata so startup replay and checkpoint size stay bounded. Segment files are numeric `.blob` files and object data is staged before metadata makes it visible.
 
 ## Testing
 
 ```sh
-go test ./...
-go test -race ./...
-go vet ./...
+make lint
+make test
+make race
+make cover
 ```
 
 ## Documentation

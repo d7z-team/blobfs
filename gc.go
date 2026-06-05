@@ -21,9 +21,10 @@ type compactResult struct {
 // RunGC marks unreferenced chunks, optionally compacts fragmented segments, and
 // deletes fully dead segments without holding metadata locks during filesystem IO.
 func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	nowTime := time.Now()
 	now := nowTime.UnixNano()
 	segmentDeleteCutoff := now - int64(s.cfg.GC.SegmentDeleteDelay)

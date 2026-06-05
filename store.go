@@ -32,13 +32,22 @@ type Store struct {
 	metaMu                 sync.RWMutex
 	meta                   *metadata
 	metaLog                afero.File
+	metaLogName            string
 	commitsSinceCheckpoint int
+	lastCheckpointErr      error
 
 	pinMu sync.Mutex
 	pins  map[string]int
 
 	writeSessionMu    sync.Mutex
 	openWriteSessions int
+
+	lifeMu  sync.Mutex
+	closing bool
+	opWG    sync.WaitGroup
+	bgWG    sync.WaitGroup
+	ctx     context.Context
+	cancel  context.CancelFunc
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -125,6 +134,7 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
+	storeCtx, cancel := context.WithCancel(context.Background())
 	store := &Store{
 		fs:          fs,
 		baseDir:     baseDir,
@@ -134,6 +144,8 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		lockPath:    filepath.Join(baseDir, "meta", "LOCK"),
 		cfg:         cfg,
 		pins:        map[string]int{},
+		ctx:         storeCtx,
+		cancel:      cancel,
 		closed:      make(chan struct{}),
 	}
 	if err := fs.MkdirAll(store.metaDir, 0o755); err != nil {
@@ -152,7 +164,7 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	store.meta, err = loadMetadata(fs, store.metaDir)
+	store.meta, store.metaLogName, err = loadMetadata(fs, store.metaDir)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -161,18 +173,40 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	logPath := filepath.Join(store.metaDir, "txlog", metaLogFile)
+	logPath := filepath.Join(store.metaDir, "txlog", store.metaLogName)
 	metaLog, err := fs.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
 	}
 	store.metaLog = metaLog
-	if err := saveSuperBlock(store.fs, store.metaDir, store.meta.TxID); err != nil {
+	if err := saveSuperBlock(store.fs, store.metaDir, store.meta.TxID, store.metaLogName); err != nil {
 		_ = store.Close()
 		return nil, err
 	}
 	return store, nil
+}
+
+func (s *Store) beginOp(ctx context.Context) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	s.lifeMu.Lock()
+	if s.closing {
+		s.lifeMu.Unlock()
+		return os.ErrClosed
+	}
+	s.opWG.Add(1)
+	s.lifeMu.Unlock()
+	if err := contextError(ctx); err != nil {
+		s.endOp()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) endOp() {
+	s.opWG.Done()
 }
 
 // Put stores or replaces a file and records optional string metadata.
@@ -181,9 +215,10 @@ func (s *Store) Put(ctx context.Context, tenantID, path string, input io.Reader,
 }
 
 func (s *Store) putObject(ctx context.Context, tenantID, path string, input io.Reader, opts putCommitOptions) (*PutResult, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	if input == nil {
 		return nil, errors.New("input reader is nil")
 	}
@@ -538,9 +573,10 @@ func (s *Store) StatObject(ctx context.Context, tenantID, path string) (*ObjectI
 }
 
 func (s *Store) UpdateMetadata(ctx context.Context, tenantID, path string, options map[string]string) (*ObjectInfo, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	if err := validateTenantID(tenantID, s.cfg); err != nil {
 		return nil, pathError("update metadata", tenantID, err)
 	}
@@ -572,9 +608,10 @@ func (s *Store) UpdateMetadata(ctx context.Context, tenantID, path string, optio
 }
 
 func (s *Store) DeleteObject(ctx context.Context, tenantID, path string) error {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return err
 	}
+	defer s.endOp()
 	if err := validateTenantID(tenantID, s.cfg); err != nil {
 		return pathError("delete", tenantID, err)
 	}
@@ -614,22 +651,27 @@ func (s *Store) StartBackground(ctx context.Context) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	select {
-	case <-s.closed:
+	s.lifeMu.Lock()
+	if s.closing {
+		s.lifeMu.Unlock()
 		return os.ErrClosed
-	default:
 	}
+	s.bgWG.Add(1)
+	s.lifeMu.Unlock()
 	ticker := time.NewTicker(time.Minute)
 	go func() {
+		defer s.bgWG.Done()
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-s.ctx.Done():
+				return
 			case <-s.closed:
 				return
 			case <-ticker.C:
-				_, _ = s.RunGC(ctx, GCOptions{Compact: true})
+				_, _ = s.RunGC(s.ctx, GCOptions{Compact: true})
 			}
 		}
 	}()
@@ -637,20 +679,38 @@ func (s *Store) StartBackground(ctx context.Context) error {
 }
 
 func (s *Store) Close() error {
+	var closeErr error
 	s.closeOnce.Do(func() {
-		s.metaMu.Lock()
-		_ = s.checkpointMetaLocked()
-		s.metaMu.Unlock()
-		close(s.closed)
-		if s.metaLog != nil {
-			_ = s.metaLog.Close()
+		s.lifeMu.Lock()
+		s.closing = true
+		if s.cancel != nil {
+			s.cancel()
 		}
+		close(s.closed)
+		s.lifeMu.Unlock()
+
+		s.bgWG.Wait()
+		s.opWG.Wait()
+
+		s.metaMu.Lock()
+		if err := s.checkpointMetaLocked(); err != nil && closeErr == nil {
+			closeErr = err
+		}
+		if s.metaLog != nil {
+			if err := s.metaLog.Close(); err != nil && closeErr == nil {
+				closeErr = err
+			}
+			s.metaLog = nil
+		}
+		s.metaMu.Unlock()
 		if s.lockFile != nil {
-			_ = s.lockFile.Close()
+			if err := s.lockFile.Close(); err != nil && closeErr == nil {
+				closeErr = err
+			}
 			_ = s.fs.Remove(s.lockPath)
 		}
 	})
-	return nil
+	return closeErr
 }
 
 func (s *Store) ensureTenantRoot(tenantID string) error {
@@ -693,7 +753,11 @@ func (s *Store) commitMetaLocked(ops []metaOp) error {
 	}
 	applyMetaTx(s.meta, tx)
 	s.commitsSinceCheckpoint++
-	_ = saveSuperBlock(s.fs, s.metaDir, s.meta.TxID)
+	if err := saveSuperBlock(s.fs, s.metaDir, s.meta.TxID, s.metaLogName); err != nil {
+		s.lastCheckpointErr = err
+	} else {
+		s.lastCheckpointErr = nil
+	}
 	if s.commitsSinceCheckpoint >= metaCheckpointInterval {
 		_ = s.checkpointMetaLocked()
 	}
@@ -702,37 +766,57 @@ func (s *Store) commitMetaLocked(ops []metaOp) error {
 
 func (s *Store) checkpointMetaLocked() error {
 	if s.metaLog == nil {
-		return nil
+		return errors.New("metadata log is not open")
 	}
+	compactMetadata(s.meta)
 	if err := saveMetaCheckpoint(s.fs, s.metaDir, s.meta); err != nil {
+		s.lastCheckpointErr = err
 		return err
 	}
-	if err := saveSuperBlock(s.fs, s.metaDir, s.meta.TxID); err != nil {
-		return err
-	}
-	logPath := filepath.Join(s.metaDir, "txlog", metaLogFile)
-	_ = s.metaLog.Close()
-	truncated, err := s.fs.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	newLog, newName, err := s.createMetaLogGenerationLocked(nextMetaLogName(s.metaLogName))
 	if err != nil {
-		s.metaLog, _ = s.fs.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		s.lastCheckpointErr = err
 		return err
 	}
-	if err := truncated.Sync(); err != nil {
-		_ = truncated.Close()
-		s.metaLog, _ = s.fs.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err := newLog.Sync(); err != nil {
+		_ = newLog.Close()
+		_ = s.fs.Remove(filepath.Join(s.metaDir, "txlog", newName))
+		s.lastCheckpointErr = err
 		return err
 	}
-	if err := truncated.Close(); err != nil {
-		s.metaLog, _ = s.fs.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err := saveSuperBlock(s.fs, s.metaDir, s.meta.TxID, newName); err != nil {
+		_ = newLog.Close()
+		_ = s.fs.Remove(filepath.Join(s.metaDir, "txlog", newName))
+		s.lastCheckpointErr = err
 		return err
 	}
-	metaLog, err := s.fs.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	s.metaLog = metaLog
+	oldLog := s.metaLog
+	oldName := s.metaLogName
+	s.metaLog = newLog
+	s.metaLogName = newName
 	s.commitsSinceCheckpoint = 0
+	s.lastCheckpointErr = nil
+	if oldLog != nil {
+		_ = oldLog.Close()
+	}
+	if oldName != "" && oldName != newName {
+		_ = s.fs.Remove(filepath.Join(s.metaDir, "txlog", oldName))
+	}
 	return nil
+}
+
+func (s *Store) createMetaLogGenerationLocked(startName string) (afero.File, string, error) {
+	name := startName
+	for i := 0; i < 1000; i++ {
+		path := filepath.Join(s.metaDir, "txlog", name)
+		file, err := s.fs.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_WRONLY, 0o600)
+		if os.IsExist(err) {
+			name = nextMetaLogName(name)
+			continue
+		}
+		return file, name, err
+	}
+	return nil, "", errors.New("create metadata log generation: exhausted attempts")
 }
 
 func (s *Store) nextInodeIDLocked() uint64 {

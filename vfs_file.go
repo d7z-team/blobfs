@@ -7,13 +7,16 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/spf13/afero"
 )
 
 type blobVFSFile struct {
+	mu             sync.Mutex
 	store          *Store
+	ctx            context.Context
 	name           string
 	tenantID       string
 	path           string
@@ -36,34 +39,43 @@ type blobVFSFile struct {
 }
 
 func (f *blobVFSFile) Close() error {
+	f.mu.Lock()
 	if f.closed {
+		f.mu.Unlock()
 		return nil
 	}
-	err := f.Sync()
+	err := f.syncLocked()
 	f.closed = true
-	if f.session != nil {
-		if closeErr := f.session.Close(); err == nil {
+	session := f.session
+	store := f.store
+	sessionName := f.sessionName
+	f.session = nil
+	f.mu.Unlock()
+
+	if session != nil {
+		if closeErr := session.Close(); err == nil {
 			err = closeErr
 		}
-		if f.store != nil && f.sessionName != "" {
-			_ = f.store.fs.Remove(f.sessionName)
-			f.store.writeSessionMu.Lock()
-			f.store.openWriteSessions--
-			f.store.writeSessionMu.Unlock()
+		if store != nil && sessionName != "" {
+			_ = store.fs.Remove(sessionName)
+			store.writeSessionMu.Lock()
+			store.openWriteSessions--
+			store.writeSessionMu.Unlock()
 		}
-		f.session = nil
 	}
 	return err
 }
 
 func (f *blobVFSFile) Read(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
 		return 0, afero.ErrFileClosed
 	}
 	if f.isDir {
 		return 0, os.ErrInvalid
 	}
-	n, err := f.ReadAt(p, f.offset)
+	n, err := f.readAtLocked(p, f.offset)
 	f.offset += int64(n)
 	if errors.Is(err, io.EOF) && n > 0 {
 		return n, nil
@@ -72,6 +84,12 @@ func (f *blobVFSFile) Read(p []byte) (int, error) {
 }
 
 func (f *blobVFSFile) ReadAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readAtLocked(p, off)
+}
+
+func (f *blobVFSFile) readAtLocked(p []byte, off int64) (int, error) {
 	if f.closed {
 		return 0, afero.ErrFileClosed
 	}
@@ -81,7 +99,7 @@ func (f *blobVFSFile) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, os.ErrInvalid
 	}
-	if off >= f.fileSize() {
+	if off >= f.fileSizeLocked() {
 		return 0, io.EOF
 	}
 	if f.session != nil {
@@ -99,15 +117,23 @@ func (f *blobVFSFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (f *blobVFSFile) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.append {
 		f.offset = f.size
 	}
-	n, err := f.WriteAt(p, f.offset)
+	n, err := f.writeAtLocked(p, f.offset)
 	f.offset += int64(n)
 	return n, err
 }
 
 func (f *blobVFSFile) WriteAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.writeAtLocked(p, off)
+}
+
+func (f *blobVFSFile) writeAtLocked(p []byte, off int64) (int, error) {
 	if f.closed {
 		return 0, afero.ErrFileClosed
 	}
@@ -136,6 +162,8 @@ func (f *blobVFSFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *blobVFSFile) Seek(offset int64, whence int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
 		return 0, afero.ErrFileClosed
 	}
@@ -146,7 +174,7 @@ func (f *blobVFSFile) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		next = f.offset + offset
 	case io.SeekEnd:
-		next = f.fileSize() + offset
+		next = f.fileSizeLocked() + offset
 	default:
 		return 0, os.ErrInvalid
 	}
@@ -162,6 +190,8 @@ func (f *blobVFSFile) Name() string {
 }
 
 func (f *blobVFSFile) Readdir(count int) ([]os.FileInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
 		return nil, afero.ErrFileClosed
 	}
@@ -210,24 +240,39 @@ func (f *blobVFSFile) ReadDir(n int) ([]fs.DirEntry, error) {
 }
 
 func (f *blobVFSFile) Stat() (os.FileInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
 		return nil, afero.ErrFileClosed
 	}
 	if f.isDir {
 		return blobFileInfo{name: filepath.Base(f.name), mode: f.mode | os.ModeDir, modTime: f.modTime, isDir: true}, nil
 	}
-	return blobFileInfo{name: filepath.Base(f.name), size: f.fileSize(), mode: f.mode.Perm(), modTime: f.modTime}, nil
+	return blobFileInfo{name: filepath.Base(f.name), size: f.fileSizeLocked(), mode: f.mode.Perm(), modTime: f.modTime}, nil
 }
 
 func (f *blobVFSFile) Sync() error {
-	if f.store == nil || !f.writable || !f.dirty {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.syncLocked()
+}
+
+func (f *blobVFSFile) syncLocked() error {
+	if f.closed {
+		return afero.ErrFileClosed
+	}
+	if f.store == nil || !f.writable || !f.dirty || f.session == nil {
 		return nil
 	}
 	if _, err := f.session.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
+	ctx := f.ctx
+	if ctx == nil {
+		ctx = f.store.ctx
+	}
 	limit := io.LimitReader(f.session, f.size)
-	result, err := f.store.putObject(context.Background(), f.tenantID, f.path, limit, putCommitOptions{
+	result, err := f.store.putObject(ctx, f.tenantID, f.path, limit, putCommitOptions{
 		baseGeneration:  f.baseGeneration,
 		checkGeneration: true,
 		mode:            f.mode,
@@ -244,6 +289,8 @@ func (f *blobVFSFile) Sync() error {
 }
 
 func (f *blobVFSFile) Truncate(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
 		return afero.ErrFileClosed
 	}
@@ -269,7 +316,7 @@ func (f *blobVFSFile) WriteString(s string) (int, error) {
 	return f.Write([]byte(s))
 }
 
-func (f *blobVFSFile) fileSize() int64 {
+func (f *blobVFSFile) fileSizeLocked() int64 {
 	if f.session != nil {
 		return f.size
 	}
