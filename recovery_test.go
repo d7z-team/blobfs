@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/spf13/afero"
 )
@@ -48,6 +49,31 @@ func TestStatsAndHealthReportsMetadata(t *testing.T) {
 	}
 	if health.State != HealthClosed || health.Readable || health.Writable {
 		t.Fatalf("bad closed health: %+v", health)
+	}
+}
+
+func TestHealthAndStatsExposeBackgroundGCFailure(t *testing.T) {
+	store := openTestStore(t)
+	gcErr := errors.New("background gc failed")
+	store.backgroundMu.Lock()
+	store.lastBackgroundGCAt = time.Now()
+	store.lastBackgroundGC = &GCResult{Epoch: 7}
+	store.lastBackgroundGCErr = gcErr
+	store.backgroundMu.Unlock()
+
+	health, err := store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if health.State != HealthDegraded || !hasHealthCheck(health, "background_gc", false) {
+		t.Fatalf("background gc failure should degrade health: %+v", health)
+	}
+	stats, err := store.Stats(testContext(t))
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.GC.LastBackgroundEpoch != 7 || stats.GC.LastBackgroundError != gcErr.Error() || stats.GC.LastBackgroundAt.IsZero() {
+		t.Fatalf("background gc stats missing: %+v", stats.GC)
 	}
 }
 

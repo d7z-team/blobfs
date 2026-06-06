@@ -33,8 +33,8 @@ func TestCheckpointFailureKeepsMetadataLogUsable(t *testing.T) {
 	store.metaMu.Unlock()
 	fsys.failSyncsTo(filepath.Join("meta", "txlog", nextLog), 1)
 
-	if _, err := store.Put(testContext(t), "tenant-a", "checkpoint/first", bytes.NewReader([]byte("first")), nil); err != nil {
-		t.Fatalf("put through checkpoint failure: %v", err)
+	if _, err := store.Put(testContext(t), "tenant-a", "checkpoint/first", bytes.NewReader([]byte("first")), nil); !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("put through checkpoint failure = %v, want injected fault", err)
 	}
 	health, err := store.Health(testContext(t))
 	if err != nil {
@@ -42,6 +42,9 @@ func TestCheckpointFailureKeepsMetadataLogUsable(t *testing.T) {
 	}
 	if health.State != HealthDegraded {
 		t.Fatalf("health state = %s, want DEGRADED", health.State)
+	}
+	if got := readTestBytes(t, store, "tenant-a", "checkpoint/first"); string(got) != "first" {
+		t.Fatalf("first content after checkpoint failure = %q", got)
 	}
 
 	if _, err := store.Put(testContext(t), "tenant-a", "checkpoint/second", bytes.NewReader([]byte("second")), nil); err != nil {

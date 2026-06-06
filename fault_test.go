@@ -84,6 +84,14 @@ func (f *faultFS) OpenFile(name string, flag int, perm os.FileMode) (afero.File,
 	return &faultFile{File: file, fs: f, name: filepath.ToSlash(name)}, nil
 }
 
+func (f *faultFS) Open(name string) (afero.File, error) {
+	file, err := f.Fs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &faultFile{File: file, fs: f, name: filepath.ToSlash(name)}, nil
+}
+
 func (f *faultFS) Rename(oldname, newname string) error {
 	f.mu.Lock()
 	matches := strings.Contains(filepath.ToSlash(oldname), f.renameContains) || strings.Contains(filepath.ToSlash(newname), f.renameContains)
@@ -394,5 +402,57 @@ func TestSystemFaultPreparedSegmentCleanupErrorIsReturned(t *testing.T) {
 	}
 	if _, openErr := store.OpenObject(testContext(t), "tenant-a", "missing-parent/blob"); !errors.Is(openErr, fs.ErrNotExist) {
 		t.Fatalf("failed put became visible: %v", openErr)
+	}
+}
+
+func TestRunGCRecordsFailedRunOnSegmentRemoveError(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/gc", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "gc/blob", bytes.Repeat([]byte("g"), 128))
+	if err := store.DeleteObject(testContext(t), "tenant-a", "gc/blob"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	fsys.failRemovesContaining(filepath.Join("data", "segments"), 1)
+	if _, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true}); !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("gc remove fault = %v, want injected fault", err)
+	}
+	store.metaMu.RLock()
+	defer store.metaMu.RUnlock()
+	if len(store.meta.GC.Recent) == 0 || store.meta.GC.Recent[len(store.meta.GC.Recent)-1].State != "FAILED" {
+		t.Fatalf("gc failure was not recorded: %+v", store.meta.GC.Recent)
+	}
+}
+
+func TestSegmentFinishReturnsDirectorySyncFailure(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	fsys.failSyncsTo(filepath.Join("data", "segments", "0000", "0000"), 1)
+	_, err = store.Put(testContext(t), "tenant-a", "missing-parent/blob", bytes.NewReader(bytes.Repeat([]byte("x"), 128)), nil)
+	if !errors.Is(err, errInjectedFSFault) && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("unexpected put error before directory sync path: %v", err)
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := store.MkdirAll("tenant-a/dirsync", 0o755); err != nil {
+			t.Fatalf("mkdirall: %v", err)
+		}
+		fsys.failSyncsTo(filepath.Join("data", "segments", "0000", "0000"), 1)
+		_, err = store.Put(testContext(t), "tenant-a", "dirsync/blob", bytes.NewReader(bytes.Repeat([]byte("x"), 128)), nil)
+	}
+	if !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("segment directory sync fault = %v, want injected fault", err)
+	}
+	if files := countRegularFiles(t, fsys, "/blobfs/data/segments"); files != 0 {
+		t.Fatalf("directory sync failure left published segment files, count=%d", files)
 	}
 }

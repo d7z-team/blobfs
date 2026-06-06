@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -291,21 +292,69 @@ func TestVFSReadOnlyFileStreamsFromObjectReader(t *testing.T) {
 	}
 }
 
-func TestBlobVFSFileCloseJoinsSyncAndSessionErrors(t *testing.T) {
+func TestBlobVFSFileCloseKeepsSessionAfterCommitError(t *testing.T) {
 	syncErr := errors.New("injected sync failure")
-	closeErr := errors.New("injected close failure")
 	file := &blobVFSFile{
 		store:    &Store{},
-		session:  &faultCloseFile{seekErr: syncErr, closeErr: closeErr},
+		session:  &faultCloseFile{seekErr: syncErr},
 		writable: true,
 		dirty:    true,
 	}
 	err := file.Close()
-	if !errors.Is(err, syncErr) || !errors.Is(err, closeErr) {
-		t.Fatalf("close error = %v, want sync and close errors", err)
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("close error = %v, want sync error", err)
+	}
+	if file.closed || file.session == nil {
+		t.Fatalf("file should stay open for retry: closed=%v session=%v", file.closed, file.session)
+	}
+}
+
+func TestBlobVFSFileCloseReportsCleanSessionCloseError(t *testing.T) {
+	closeErr := errors.New("injected close failure")
+	file := &blobVFSFile{
+		store:    &Store{},
+		session:  &faultCloseFile{closeErr: closeErr},
+		writable: true,
+	}
+	err := file.Close()
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("close error = %v, want session close error", err)
 	}
 	if !file.closed || file.session != nil {
 		t.Fatalf("file was not closed cleanly: closed=%v session=%v", file.closed, file.session)
+	}
+}
+
+func TestVFSFileCloseCommitFailureCanRetry(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/retry", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	file, err := store.OpenFile("tenant-a/retry/blob", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	if _, err := file.Write([]byte("retry payload")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	fsys.failWritesTo(filepath.Join("meta", "txlog", store.metaLogName), 1)
+	if err := file.Close(); !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("first close = %v, want injected fault", err)
+	}
+	vfsFile := file.(*blobVFSFile)
+	if vfsFile.closed || vfsFile.session == nil {
+		t.Fatalf("failed close should keep session for retry: closed=%v session=%v", vfsFile.closed, vfsFile.session)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+	if got := readTestBytes(t, store, "tenant-a", "retry/blob"); string(got) != "retry payload" {
+		t.Fatalf("retry content = %q", got)
 	}
 }
 

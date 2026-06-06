@@ -132,6 +132,49 @@ func TestPutReusedChunkSurvivesInterleavedGC(t *testing.T) {
 	}
 }
 
+func TestPutRevivesCorruptChunkWithoutRefCountDrift(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/revive", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := bytes.Repeat([]byte("revive-corrupt-"), 32)
+	putTestBytes(t, store, "tenant-a", "revive/original", data)
+	store.metaMu.Lock()
+	var chunkID string
+	for id, chunk := range store.meta.Chunks {
+		next := *chunk
+		next.State = chunkStateCorrupt
+		next.CorruptAt = nowUnix()
+		next.CorruptReason = "test corrupt chunk"
+		if err := store.commitMetaLocked([]metaOp{{Type: "put_chunk", Chunk: &next}}); err != nil {
+			store.metaMu.Unlock()
+			t.Fatalf("mark corrupt: %v", err)
+		}
+		chunkID = id
+		break
+	}
+	store.metaMu.Unlock()
+	if chunkID == "" {
+		t.Fatal("expected chunk")
+	}
+
+	putTestBytes(t, store, "tenant-a", "revive/original", data)
+	putTestBytes(t, store, "tenant-a", "revive/second", data)
+
+	store.metaMu.RLock()
+	chunk := store.meta.Chunks[chunkID]
+	store.metaMu.RUnlock()
+	if chunk == nil || chunk.State != chunkStateActive || chunk.RefCount != 2 {
+		t.Fatalf("revived chunk = %+v, want active refcount 2", chunk)
+	}
+	if got := readTestBytes(t, store, "tenant-a", "revive/original"); !bytes.Equal(got, data) {
+		t.Fatalf("original content mismatch")
+	}
+	if got := readTestBytes(t, store, "tenant-a", "revive/second"); !bytes.Equal(got, data) {
+		t.Fatalf("second content mismatch")
+	}
+}
+
 func TestGCSkipsCorruptUnreferencedChunksWithoutNoopTransaction(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/gc", 0o755); err != nil {
@@ -169,8 +212,15 @@ func TestGCSkipsCorruptUnreferencedChunksWithoutNoopTransaction(t *testing.T) {
 	store.metaMu.RLock()
 	txDelta := store.meta.TxID - before
 	store.metaMu.RUnlock()
-	if result.ChunksDeleted != 0 || txDelta != 1 {
+	if result.ChunksDeleted != 0 || txDelta != 2 {
 		t.Fatalf("gc wrote unexpected corrupt chunk update: result=%+v txDelta=%d", result, txDelta)
+	}
+	stats, err := store.Stats(testContext(t))
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.GC.LastRunState != "DONE" {
+		t.Fatalf("gc run state = %q, want DONE", stats.GC.LastRunState)
 	}
 }
 

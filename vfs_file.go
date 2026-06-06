@@ -45,6 +45,10 @@ func (f *blobVFSFile) Close() error {
 		return nil
 	}
 	err := f.syncLocked()
+	if err != nil && f.session != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		f.mu.Unlock()
+		return err
+	}
 	f.closed = true
 	reader := f.reader
 	session := f.session

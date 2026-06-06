@@ -342,6 +342,9 @@ func (s *Store) RemoveAll(name string) error {
 	}
 	now := nowUnix()
 	ops := []metaOp{{Type: "delete_dirent", ParentID: parentID, Name: base}}
+	// RemoveAll is an immediate namespace detach. For huge directory trees we do
+	// not synchronously walk every descendant; unreachable child inodes and their
+	// chunk references are reclaimed by GC.
 	next := cloneInode(inode)
 	next.State = fileStateDeleted
 	next.DeletedAt = now

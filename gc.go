@@ -66,7 +66,9 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 	epoch := s.meta.NextGCEpoch
 	s.meta.NextGCEpoch++
 	result.Epoch = epoch
-	ops := []metaOp{{Type: "append_gcrun", GCRun: &gcRun{Epoch: epoch, State: "DONE", StartedAt: now, FinishedAt: now, SafetyCutoff: nowTime.Add(-safetyWindow).UnixNano()}}}
+	startedAt := now
+	safetyCutoff := nowTime.Add(-safetyWindow).UnixNano()
+	ops := []metaOp{{Type: "append_gcrun", GCRun: &gcRun{Epoch: epoch, State: "STARTED", StartedAt: startedAt, SafetyCutoff: safetyCutoff}}}
 	s.collectUnreachableInodesLocked(now, &ops)
 	if err := s.commitMetaLocked(ops); err != nil {
 		s.metaMu.Unlock()
@@ -77,7 +79,7 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 	s.markUnreferencedChunksLocked(now, nowTime.Add(-safetyWindow).UnixNano(), confirmCycles, result, &ops)
 	if err := s.commitMetaLocked(ops); err != nil {
 		s.metaMu.Unlock()
-		return nil, err
+		return result, errors.Join(err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
 	}
 
 	compactCandidates, removeSegments = s.collectSegmentWorkLocked(segmentDeleteCutoff, opts.Compact)
@@ -90,7 +92,7 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 		}
 		if err := s.commitMetaLocked(ops); err != nil {
 			s.metaMu.Unlock()
-			return nil, err
+			return result, errors.Join(err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
 		}
 	}
 	s.metaMu.Unlock()
@@ -98,12 +100,13 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 	if len(compactCandidates) > 0 {
 		compacted, err := s.compactCandidates(ctx, compactCandidates)
 		if err != nil {
-			return result, errors.Join(err, s.rollbackCompaction(compactCandidates))
+			err = errors.Join(err, s.rollbackCompaction(compactCandidates))
+			return result, errors.Join(err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
 		}
 		deleted, err := s.commitCompactionResults(compacted, result, now, segmentDeleteCutoff)
 		if err != nil {
 			err = errors.Join(err, s.removeCompactedSegments(compacted), s.rollbackCompaction(compactCandidates))
-			return result, err
+			return result, errors.Join(err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
 		}
 		removeSegments = append(removeSegments, deleted...)
 		s.metaMu.RLock()
@@ -114,10 +117,12 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 
 	deleted, err := s.removeSegmentFiles(ctx, removeSegments)
 	if err != nil || len(deleted) == 0 {
-		return result, err
+		if err != nil {
+			return result, errors.Join(err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
+		}
+		return result, s.recordGCRun(epoch, "DONE", startedAt, safetyCutoff, "")
 	}
 	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
 	ops = ops[:0]
 	_, removable := s.collectSegmentWorkLocked(segmentDeleteCutoff, false)
 	ready := make(map[string]bool, len(removable))
@@ -133,7 +138,29 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 			result.SegmentsDeleted++
 		}
 	}
-	return result, s.commitMetaLocked(ops)
+	if err := s.commitMetaLocked(ops); err != nil {
+		s.metaMu.Unlock()
+		return result, errors.Join(err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
+	}
+	s.metaMu.Unlock()
+	if err := s.recordGCRun(epoch, "DONE", startedAt, safetyCutoff, ""); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func (s *Store) recordGCRun(epoch int64, state string, startedAt, safetyCutoff int64, notes string) error {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	run := &gcRun{
+		Epoch:        epoch,
+		State:        state,
+		StartedAt:    startedAt,
+		FinishedAt:   nowUnix(),
+		SafetyCutoff: safetyCutoff,
+		Notes:        notes,
+	}
+	return s.commitMetaLocked([]metaOp{{Type: "put_gcrun", GCRun: run}})
 }
 
 func (s *Store) markUnreferencedChunksLocked(now, cutoff int64, confirmCycles int, result *GCResult, ops *[]metaOp) {

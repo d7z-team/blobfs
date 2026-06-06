@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/afero"
@@ -153,6 +154,26 @@ func TestReadPathRejectsChunkHashMismatch(t *testing.T) {
 	defer reader.Close()
 	if _, err := io.ReadAll(reader); !errors.Is(err, errChunkHashMismatch) {
 		t.Fatalf("hash-mismatched read = %v, want errChunkHashMismatch", err)
+	}
+}
+
+func TestReadChunkPayloadReportsMetadataChecksumAndRawSizeMismatch(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/mismatch", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "mismatch/blob", bytes.Repeat([]byte("m"), 128))
+	chunk, segment := firstChunkSnapshot(t, store, "tenant-a", "mismatch/blob")
+
+	badChecksum := chunk
+	badChecksum.ChecksumCRC32C++
+	if _, err := store.readChunkPayloadAt(segment, badChecksum); err == nil || !strings.Contains(err.Error(), "chunk metadata checksum mismatch") {
+		t.Fatalf("checksum mismatch error = %v", err)
+	}
+	badRawSize := chunk
+	badRawSize.RawSize++
+	if _, err := store.readChunkPayloadAt(segment, badRawSize); err == nil || !strings.Contains(err.Error(), "chunk metadata raw size mismatch") {
+		t.Fatalf("raw size mismatch error = %v", err)
 	}
 }
 

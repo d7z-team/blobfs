@@ -400,6 +400,21 @@ func applyMetaOp(meta *metadata, op metaOp) {
 			meta.GC.Recent = append(meta.GC.Recent, *op.GCRun)
 			trimRecentGCRuns(meta)
 		}
+	case "put_gcrun":
+		if op.GCRun != nil {
+			if op.GCRun.Epoch > meta.GC.LastEpoch {
+				meta.GC.LastEpoch = op.GCRun.Epoch
+			}
+			for i := range meta.GC.Recent {
+				if meta.GC.Recent[i].Epoch == op.GCRun.Epoch {
+					meta.GC.Recent[i] = *op.GCRun
+					return
+				}
+			}
+			meta.GC.TotalRuns++
+			meta.GC.Recent = append(meta.GC.Recent, *op.GCRun)
+			trimRecentGCRuns(meta)
+		}
 	}
 }
 

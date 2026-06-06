@@ -37,6 +37,14 @@ var zstdEncoderPool = sync.Pool{New: func() any {
 	return enc
 }}
 
+var zstdDecoderPool = sync.Pool{New: func() any {
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		return err
+	}
+	return dec
+}}
+
 type segmentBatchWriter struct {
 	store    *Store
 	current  *preparedSegment
@@ -158,6 +166,9 @@ func (w *segmentBatchWriter) finish() error {
 			return errors.Join(err, w.removePublished(published))
 		}
 		published = append(published, seg)
+		if err := syncDir(w.store.fs, filepath.Dir(final)); err != nil {
+			return errors.Join(err, w.removePublished(published))
+		}
 	}
 	return nil
 }
@@ -180,6 +191,14 @@ func (w *segmentBatchWriter) removePublished(segments []*segmentRecord) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func syncDir(fs afero.Fs, dir string) error {
+	file, err := fs.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(file.Sync(), file.Close())
 }
 
 func (w *segmentBatchWriter) cleanup() {
@@ -273,8 +292,11 @@ func (s *Store) readChunkPayloadAt(seg segmentRecord, chunk chunkRecord) ([]byte
 	if _, err = file.ReadAt(payload, chunk.SegmentOffset+recordHeaderSize); err != nil {
 		return nil, err
 	}
-	if crc32.Checksum(payload, crc32cTable) != checksum || checksum != chunk.ChecksumCRC32C {
-		return nil, errors.New("segment record checksum mismatch")
+	if crc32.Checksum(payload, crc32cTable) != checksum {
+		return nil, errors.New("segment payload crc32c mismatch")
+	}
+	if checksum != chunk.ChecksumCRC32C {
+		return nil, errors.New("chunk metadata checksum mismatch")
 	}
 	if compression != compressionZstdID {
 		return nil, errors.New("unsupported compression")
@@ -283,8 +305,11 @@ func (s *Store) readChunkPayloadAt(seg segmentRecord, chunk chunkRecord) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(raw)) != rawSize || rawSize != chunk.RawSize {
+	if int64(len(raw)) != rawSize {
 		return nil, errors.New("segment record raw size mismatch")
+	}
+	if rawSize != chunk.RawSize {
+		return nil, errors.New("chunk metadata raw size mismatch")
 	}
 	gotChunkID := hashBytes(chunk.TenantID, chunk.TenantID != "", raw)
 	if gotChunkID != chunk.ChunkID {
@@ -304,10 +329,11 @@ func compressZstd(raw []byte) ([]byte, error) {
 }
 
 func decompressZstd(payload []byte) ([]byte, error) {
-	dec, err := zstd.NewReader(bytes.NewReader(payload))
-	if err != nil {
+	item := zstdDecoderPool.Get()
+	if err, ok := item.(error); ok {
 		return nil, err
 	}
-	defer dec.Close()
-	return io.ReadAll(dec)
+	dec := item.(*zstd.Decoder)
+	defer zstdDecoderPool.Put(dec)
+	return dec.DecodeAll(payload, nil)
 }

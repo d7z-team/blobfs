@@ -854,26 +854,37 @@ func TestCheckpointCompactsMetadataLogAndRecovers(t *testing.T) {
 	}
 }
 
-func TestRemoveAllDetachesImmediatelyAndGCReleasesRefs(t *testing.T) {
+func TestRemoveAllDetachesNamespaceAndGCReleasesRefs(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/tree/sub", 0o755); err != nil {
 		t.Fatalf("mkdirall: %v", err)
 	}
-	putTestBytes(t, store, "tenant-a", "tree/sub/blob", bytes.Repeat([]byte("x"), 512))
+	removed := putTestBytes(t, store, "tenant-a", "tree/sub/blob", bytes.Repeat([]byte("x"), 512))
+	store.metaMu.RLock()
+	removedManifest := store.meta.Manifests[removed.ManifestID]
+	removedChunks := map[string]bool{}
+	for _, ref := range removedManifest.Chunks {
+		removedChunks[ref.ChunkID] = true
+	}
+	store.metaMu.RUnlock()
 	if err := store.RemoveAll("tenant-a/tree"); err != nil {
 		t.Fatalf("removeall: %v", err)
 	}
 	if _, err := store.OpenObject(testContext(t), "tenant-a", "tree/sub/blob"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("detached path should not exist, got %v", err)
 	}
+	if err := store.MkdirAll("tenant-a/tree/sub", 0o755); err != nil {
+		t.Fatalf("recreate removed tree: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "tree/sub/new", []byte("new"))
 	if _, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1}); err != nil {
 		t.Fatalf("gc: %v", err)
 	}
 	store.metaMu.RLock()
 	defer store.metaMu.RUnlock()
 	for _, chunk := range store.meta.Chunks {
-		if chunk.RefCount != 0 {
-			t.Fatalf("chunk refcount not released: %+v", chunk)
+		if removedChunks[chunk.ChunkID] && chunk.RefCount != 0 {
+			t.Fatalf("removed chunk refcount not released: %+v", chunk)
 		}
 	}
 }

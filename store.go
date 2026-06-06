@@ -43,6 +43,11 @@ type Store struct {
 	writeSessionMu    sync.Mutex
 	openWriteSessions int
 
+	backgroundMu        sync.Mutex
+	lastBackgroundGCAt  time.Time
+	lastBackgroundGC    *GCResult
+	lastBackgroundGCErr error
+
 	lifeMu  sync.Mutex
 	closing bool
 	bgRuns  bool
@@ -465,7 +470,10 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 		}
 		chunkCopy := *chunk
 		if newChunkRef[chunkCopy.ChunkID] {
-			chunkCopy.RefCount = 1
+			chunkCopy.RefCount = 0
+			if current != nil && current.State == chunkStateCorrupt {
+				chunkCopy.RefCount = current.RefCount
+			}
 		}
 		ops = append(ops, metaOp{Type: "put_chunk", Chunk: &chunkCopy})
 	}
@@ -690,7 +698,17 @@ func (s *Store) StartBackground(ctx context.Context) error {
 			case <-s.closed:
 				return
 			case <-ticker.C:
-				_, _ = s.RunGC(s.ctx, GCOptions{Compact: true})
+				result, err := s.RunGC(s.ctx, GCOptions{Compact: true})
+				s.backgroundMu.Lock()
+				s.lastBackgroundGCAt = time.Now()
+				if result != nil {
+					copyResult := *result
+					s.lastBackgroundGC = &copyResult
+				} else {
+					s.lastBackgroundGC = nil
+				}
+				s.lastBackgroundGCErr = err
+				s.backgroundMu.Unlock()
 			}
 		}
 	}()
@@ -771,11 +789,13 @@ func (s *Store) commitMetaLocked(ops []metaOp) error {
 	s.commitsSinceCheckpoint++
 	if err := saveSuperBlock(s.fs, s.metaDir, s.meta.TxID, s.metaLogName); err != nil {
 		s.lastCheckpointErr = err
-	} else {
-		s.lastCheckpointErr = nil
+		return err
 	}
+	s.lastCheckpointErr = nil
 	if s.commitsSinceCheckpoint >= metaCheckpointInterval {
-		_ = s.checkpointMetaLocked()
+		if err := s.checkpointMetaLocked(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -958,10 +978,20 @@ func appendRefDeltaOpsLocked(meta *metadata, ops *[]metaOp, manifestRecords map[
 		}
 		*ops = append(*ops, metaOp{Type: "put_manifest", Manifest: next})
 	}
+	pendingChunks := map[string]*chunkRecord{}
+	for i := range *ops {
+		op := &(*ops)[i]
+		if op.Type == "put_chunk" && op.Chunk != nil {
+			pendingChunks[op.Chunk.ChunkID] = op.Chunk
+		}
+	}
 	for chunkID, delta := range chunkDeltas {
-		chunk := meta.Chunks[chunkID]
+		chunk := pendingChunks[chunkID]
 		if chunk == nil {
-			continue
+			chunk = meta.Chunks[chunkID]
+			if chunk == nil {
+				continue
+			}
 		}
 		next := *chunk
 		next.RefCount += delta

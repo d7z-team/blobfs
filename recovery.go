@@ -75,8 +75,12 @@ type ByteStats struct {
 
 // GCStats summarizes recorded GC runs.
 type GCStats struct {
-	Runs      int
-	LastEpoch int64
+	Runs                int
+	LastEpoch           int64
+	LastRunState        string
+	LastBackgroundAt    time.Time
+	LastBackgroundEpoch int64
+	LastBackgroundError string
 }
 
 // StatsSnapshot is a point-in-time metadata-only statistics snapshot.
@@ -263,9 +267,18 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		}
 	}
 	s.metaMu.RUnlock()
+	s.backgroundMu.Lock()
+	backgroundErr := s.lastBackgroundGCErr
+	s.backgroundMu.Unlock()
 	report.Checks = append(report.Checks, HealthCheck{Name: "metadata_loaded", OK: metaLoaded, Message: healthMessage(metaLoaded, "metadata loaded", "metadata is nil")})
 	report.Checks = append(report.Checks, HealthCheck{Name: "txlog_available", OK: txlogOK, Message: healthMessage(txlogOK, "metadata log is open", "metadata log is unavailable")})
 	report.Checks = append(report.Checks, HealthCheck{Name: "checkpoint_healthy", OK: checkpointOK, Message: checkpointMessage})
+	backgroundOK := backgroundErr == nil
+	backgroundMessage := "background GC is healthy"
+	if backgroundErr != nil {
+		backgroundMessage = backgroundErr.Error()
+	}
+	report.Checks = append(report.Checks, HealthCheck{Name: "background_gc", OK: backgroundOK, Message: backgroundMessage})
 	report.Checks = append(report.Checks, HealthCheck{
 		Name:    "metadata_log_replay",
 		OK:      len(replayWarnings) == 0,
@@ -297,7 +310,7 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		report.Writable = false
 		return report, nil
 	}
-	if !checkpointOK || hasCompactingSegments || len(replayWarnings) > 0 {
+	if !checkpointOK || !backgroundOK || hasCompactingSegments || len(replayWarnings) > 0 {
 		report.State = HealthDegraded
 	}
 	return report, nil
@@ -360,6 +373,18 @@ func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
 	}
 	stats.GC.Runs = int(s.meta.GC.TotalRuns)
 	stats.GC.LastEpoch = s.meta.GC.LastEpoch
+	if len(s.meta.GC.Recent) > 0 {
+		stats.GC.LastRunState = s.meta.GC.Recent[len(s.meta.GC.Recent)-1].State
+	}
+	s.backgroundMu.Lock()
+	stats.GC.LastBackgroundAt = s.lastBackgroundGCAt
+	if s.lastBackgroundGC != nil {
+		stats.GC.LastBackgroundEpoch = s.lastBackgroundGC.Epoch
+	}
+	if s.lastBackgroundGCErr != nil {
+		stats.GC.LastBackgroundError = s.lastBackgroundGCErr.Error()
+	}
+	s.backgroundMu.Unlock()
 	return stats, nil
 }
 
