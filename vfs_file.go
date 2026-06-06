@@ -39,15 +39,22 @@ type blobVFSFile struct {
 }
 
 func (f *blobVFSFile) Close() error {
+	return f.close(true)
+}
+
+func (f *blobVFSFile) close(syncDirty bool) error {
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
 		return nil
 	}
-	err := f.syncLocked()
-	if err != nil && f.session != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		f.mu.Unlock()
-		return err
+	var err error
+	if syncDirty {
+		err = f.syncLocked()
+		if err != nil && f.session != nil && !isTerminalVFSCommitError(err) {
+			f.mu.Unlock()
+			return err
+		}
 	}
 	f.closed = true
 	reader := f.reader
@@ -72,7 +79,18 @@ func (f *blobVFSFile) Close() error {
 			store.writeSessionMu.Unlock()
 		}
 	}
+	if store != nil {
+		store.unregisterHandle(f)
+	}
 	return err
+}
+
+func (f *blobVFSFile) forceCloseFromStore() error {
+	return f.close(false)
+}
+
+func isTerminalVFSCommitError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed)
 }
 
 func (f *blobVFSFile) Read(p []byte) (int, error) {

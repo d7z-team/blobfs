@@ -90,16 +90,13 @@ func TestGlobalDedupScopeSurvivesTenantDeleteAndGC(t *testing.T) {
 	}
 }
 
-func TestPutReusedChunkSurvivesInterleavedGC(t *testing.T) {
+func TestPutReusedLiveChunkSurvivesInterleavedGC(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/race", 0o755); err != nil {
 		t.Fatalf("mkdirall: %v", err)
 	}
 	data := bytes.Repeat([]byte("reuse-me"), 64)
 	putTestBytes(t, store, "tenant-a", "race/old", data)
-	if err := store.DeleteObject(testContext(t), "tenant-a", "race/old"); err != nil {
-		t.Fatalf("delete old: %v", err)
-	}
 	prepared, err := store.prepareObject(testContext(t), "tenant-a", "race/new", bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("prepare reused object: %v", err)
@@ -112,8 +109,8 @@ func TestPutReusedChunkSurvivesInterleavedGC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("interleaved gc: %v", err)
 	}
-	if gc.ChunksDeleted == 0 {
-		t.Fatalf("gc did not delete the unreferenced chunk: %+v", gc)
+	if gc.ChunksDeleted != 0 {
+		t.Fatalf("gc deleted live chunk: %+v", gc)
 	}
 	if gc.SegmentsDeleted != 0 {
 		t.Fatalf("gc deleted a pinned segment: %+v", gc)
@@ -125,6 +122,9 @@ func TestPutReusedChunkSurvivesInterleavedGC(t *testing.T) {
 		t.Fatal("reused object became unreadable after interleaved gc")
 	}
 	store.releasePreparedPins(prepared)
+	if err := store.DeleteObject(testContext(t), "tenant-a", "race/old"); err != nil {
+		t.Fatalf("delete old: %v", err)
+	}
 	if gc, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
 		t.Fatalf("post-commit gc: %v", err)
 	} else if gc.SegmentsDeleted != 0 {

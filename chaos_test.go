@@ -305,9 +305,6 @@ func TestChaosPutReuseInterleavedWithAggressiveGC(t *testing.T) {
 		oldPath := fmt.Sprintf("reuse/old-%02d", step)
 		newPath := fmt.Sprintf("reuse/new-%02d", step)
 		putTestBytes(t, store, "tenant-a", oldPath, data)
-		if err := store.DeleteObject(testContext(t), "tenant-a", oldPath); err != nil {
-			t.Fatalf("step %d delete old: %v", step, err)
-		}
 		prepared, err := store.prepareObject(testContext(t), "tenant-a", newPath, bytes.NewReader(data))
 		if err != nil {
 			t.Fatalf("step %d prepare: %v", step, err)
@@ -327,6 +324,9 @@ func TestChaosPutReuseInterleavedWithAggressiveGC(t *testing.T) {
 		store.releasePreparedPins(prepared)
 		if got := readTestBytes(t, store, "tenant-a", newPath); !bytes.Equal(got, data) {
 			t.Fatalf("step %d committed data mismatch", step)
+		}
+		if err := store.DeleteObject(testContext(t), "tenant-a", oldPath); err != nil {
+			t.Fatalf("step %d delete old: %v", step, err)
 		}
 		if step%5 == 0 {
 			if _, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {

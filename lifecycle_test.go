@@ -156,6 +156,124 @@ func TestObjectReaderConcurrentCloseKeepsOtherReaderPinned(t *testing.T) {
 	}
 }
 
+func TestStoreCloseClosesOpenHandlesAndRejectsNewWork(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/close", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "close/blob", []byte("payload"))
+	reader, err := store.OpenObject(testContext(t), "tenant-a", "close/blob")
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	file, err := store.OpenFile("tenant-a/close/blob", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	dir, err := store.Open("tenant-a/close")
+	if err != nil {
+		t.Fatalf("open dir: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("store close: %v", err)
+	}
+	if _, err := reader.Read(make([]byte, 1)); !errors.Is(err, ErrReaderClosed) {
+		t.Fatalf("reader after store close = %v, want ErrReaderClosed", err)
+	}
+	if _, err := file.Read(make([]byte, 1)); !errors.Is(err, afero.ErrFileClosed) {
+		t.Fatalf("vfs reader after store close = %v, want file closed", err)
+	}
+	if _, err := dir.Readdir(1); !errors.Is(err, afero.ErrFileClosed) {
+		t.Fatalf("dir after store close = %v, want file closed", err)
+	}
+	if _, err := store.OpenObject(testContext(t), "tenant-a", "close/blob"); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("open after close = %v, want os.ErrClosed", err)
+	}
+	if _, err := store.StatObject(testContext(t), "tenant-a", "close/blob"); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("stat after close = %v, want os.ErrClosed", err)
+	}
+	if _, err := store.Stats(testContext(t)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("stats after close = %v, want os.ErrClosed", err)
+	}
+	if report, err := store.Health(testContext(t)); err != nil || report.State != HealthClosed {
+		t.Fatalf("health after close = %+v, %v; want CLOSED", report, err)
+	}
+}
+
+func TestStoreCloseCleansDirtyVFSWriteSession(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/close", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	file, err := store.OpenFile("tenant-a/close/dirty.txt", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("open dirty file: %v", err)
+	}
+	if _, err := file.Write([]byte("dirty")); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	if sessions := openWriteSessionCount(store); sessions != 1 {
+		t.Fatalf("open write sessions before close = %d, want 1", sessions)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("store close: %v", err)
+	}
+	if sessions := openWriteSessionCount(store); sessions != 0 {
+		t.Fatalf("open write sessions after close = %d, want 0", sessions)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("file close after store close: %v", err)
+	}
+}
+
+func TestPutRewritesUnreferencedChunkInsteadOfReusingIt(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/reuse", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := []byte("same content")
+	first := putTestBytes(t, store, "tenant-a", "reuse/old", data)
+	store.metaMu.RLock()
+	oldManifest := store.meta.Manifests[first.ManifestID]
+	oldSegmentID := ""
+	if oldManifest != nil && len(oldManifest.Chunks) == 1 {
+		if oldChunk := store.meta.Chunks[oldManifest.Chunks[0].ChunkID]; oldChunk != nil {
+			oldSegmentID = oldChunk.SegmentID
+		}
+	}
+	store.metaMu.RUnlock()
+	if oldSegmentID == "" {
+		t.Fatal("old chunk segment is empty")
+	}
+	if err := store.DeleteObject(testContext(t), "tenant-a", "reuse/old"); err != nil {
+		t.Fatalf("delete old: %v", err)
+	}
+	second := putTestBytes(t, store, "tenant-a", "reuse/new", data)
+	if first.ManifestID != second.ManifestID {
+		t.Fatalf("manifest changed for identical content: %s != %s", first.ManifestID, second.ManifestID)
+	}
+	store.metaMu.RLock()
+	manifest := store.meta.Manifests[second.ManifestID]
+	if manifest == nil || len(manifest.Chunks) != 1 {
+		store.metaMu.RUnlock()
+		t.Fatalf("manifest = %+v", manifest)
+	}
+	chunk := store.meta.Chunks[manifest.Chunks[0].ChunkID]
+	segmentID := ""
+	refCount := 0
+	if chunk != nil {
+		segmentID = chunk.SegmentID
+		refCount = chunk.RefCount
+	}
+	store.metaMu.RUnlock()
+	if refCount != 1 {
+		t.Fatalf("chunk refcount = %d, want 1", refCount)
+	}
+	if oldSegmentID == segmentID {
+		t.Fatalf("unreferenced chunk reused old segment %s", segmentID)
+	}
+}
+
 func TestVFSFileConcurrentCloseCleansSessionOnce(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/vfs", 0o755); err != nil {

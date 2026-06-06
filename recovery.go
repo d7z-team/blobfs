@@ -322,9 +322,10 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 
 // Stats returns metadata-only counters without filesystem scanning.
 func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
 	stats := &StatsSnapshot{TxID: s.meta.TxID, Tenants: len(s.meta.Tenants), GeneratedAt: time.Now()}
@@ -394,9 +395,10 @@ func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
 
 // Diagnose scans metadata and optional filesystem state for recoverable issues.
 func (s *Store) Diagnose(ctx context.Context, opts DiagnoseOptions) (*DiagnoseReport, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	report := &DiagnoseReport{Healthy: true, GeneratedAt: time.Now()}
 	limitReached := false
 	addIssue := func(issue Issue) {

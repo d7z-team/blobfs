@@ -48,6 +48,9 @@ type Store struct {
 	lastBackgroundGC    *GCResult
 	lastBackgroundGCErr error
 
+	handleMu sync.Mutex
+	handles  map[storeHandle]struct{}
+
 	lifeMu  sync.Mutex
 	closing bool
 	bgRuns  bool
@@ -151,6 +154,7 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		lockPath:    filepath.Join(baseDir, "meta", "LOCK"),
 		cfg:         cfg,
 		pins:        map[string]int{},
+		handles:     map[storeHandle]struct{}{},
 		ctx:         storeCtx,
 		cancel:      cancel,
 		closed:      make(chan struct{}),
@@ -216,6 +220,44 @@ func (s *Store) beginOp(ctx context.Context) error {
 
 func (s *Store) endOp() {
 	s.opWG.Done()
+}
+
+type storeHandle interface {
+	forceCloseFromStore() error
+}
+
+func (s *Store) registerHandle(handle storeHandle) error {
+	s.lifeMu.Lock()
+	if s.closing {
+		s.lifeMu.Unlock()
+		return os.ErrClosed
+	}
+	s.handleMu.Lock()
+	s.handles[handle] = struct{}{}
+	s.handleMu.Unlock()
+	s.lifeMu.Unlock()
+	return nil
+}
+
+func (s *Store) unregisterHandle(handle storeHandle) {
+	s.handleMu.Lock()
+	delete(s.handles, handle)
+	s.handleMu.Unlock()
+}
+
+func (s *Store) closeHandles() error {
+	s.handleMu.Lock()
+	handles := make([]storeHandle, 0, len(s.handles))
+	for handle := range s.handles {
+		handles = append(handles, handle)
+	}
+	s.handleMu.Unlock()
+
+	var err error
+	for _, handle := range handles {
+		err = errors.Join(err, handle.forceCloseFromStore())
+	}
+	return err
 }
 
 // Put stores or replaces a file and records optional string metadata.
@@ -447,7 +489,8 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 		chunk := prepared.chunks[chunkID]
 		current := s.meta.Chunks[chunkID]
 		segment := s.meta.Segments[chunk.SegmentID]
-		if current == nil || current.State == chunkStateCorrupt || segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateCorrupt {
+		if current == nil || current.State != chunkStateActive ||
+			segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateCorrupt {
 			return nil, errChunkNotReadable
 		}
 	}
@@ -462,7 +505,7 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 	}
 	for _, chunk := range prepared.chunks {
 		current := s.meta.Chunks[chunk.ChunkID]
-		if current != nil && current.State != chunkStateDeleted && current.State != chunkStateCorrupt {
+		if current != nil && current.State == chunkStateActive && current.RefCount > 0 {
 			continue
 		}
 		chunkCopy := *chunk
@@ -548,18 +591,20 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 // OpenObject opens an immutable reader for the active object at tenantID/path.
 // The returned reader pins referenced segments until Close is called.
 func (s *Store) OpenObject(ctx context.Context, tenantID, path string) (*ObjectReader, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	return s.openReader(tenantID, path, 0, -1)
 }
 
 // OpenRange opens a reader limited to [offset, offset+length). If length extends
 // past the object size, the reader stops at EOF.
 func (s *Store) OpenRange(ctx context.Context, tenantID, path string, offset, length int64) (io.ReadCloser, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	if offset < 0 || length < 0 {
 		return nil, ErrInvalidRange
 	}
@@ -568,9 +613,10 @@ func (s *Store) OpenRange(ctx context.Context, tenantID, path string, offset, le
 
 // StatObject returns metadata for an active file object without opening its content.
 func (s *Store) StatObject(ctx context.Context, tenantID, path string) (*ObjectInfo, error) {
-	if err := contextError(ctx); err != nil {
+	if err := s.beginOp(ctx); err != nil {
 		return nil, err
 	}
+	defer s.endOp()
 	if err := validateTenantID(tenantID, s.cfg); err != nil {
 		return nil, pathError("stat", tenantID, err)
 	}
@@ -736,6 +782,7 @@ func (s *Store) Close() error {
 
 		s.bgWG.Wait()
 		s.opWG.Wait()
+		closeErr = errors.Join(closeErr, s.closeHandles())
 
 		s.metaMu.Lock()
 		closeErr = errors.Join(closeErr, s.checkpointMetaLocked())
@@ -935,7 +982,7 @@ func (s *Store) pinChunkSnapshot(chunkID string) *chunkRecord {
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
 	chunk := s.meta.Chunks[chunkID]
-	if chunk == nil || chunk.State == chunkStateDeleted || chunk.State == chunkStateCorrupt {
+	if chunk == nil || chunk.RefCount <= 0 || chunk.State != chunkStateActive {
 		return nil
 	}
 	segment := s.meta.Segments[chunk.SegmentID]

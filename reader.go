@@ -91,7 +91,7 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 			limitEnd = rangeOffset + rangeLength
 		}
 	}
-	return &ObjectReader{
+	reader := &ObjectReader{
 		store:          s,
 		size:           inode.Size,
 		offset:         rangeOffset,
@@ -101,7 +101,12 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 		fileHash:       inode.FileHash,
 		info:           objectInfoFromInode(inode, path),
 		pinnedSegments: pinned,
-	}, nil
+	}
+	if err := s.registerHandle(reader); err != nil {
+		_ = reader.Close()
+		return nil, err
+	}
+	return reader, nil
 }
 
 // Read copies object bytes into p from the current reader offset.
@@ -191,7 +196,12 @@ func (r *ObjectReader) Close() error {
 	for _, segmentID := range pinned {
 		r.store.unpinSegment(segmentID)
 	}
+	r.store.unregisterHandle(r)
 	return nil
+}
+
+func (r *ObjectReader) forceCloseFromStore() error {
+	return r.Close()
 }
 
 // Info returns metadata captured when the reader was opened.

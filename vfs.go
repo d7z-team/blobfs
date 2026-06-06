@@ -49,7 +49,7 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 		if writable {
 			return nil, pathError("open", name, fs.ErrInvalid)
 		}
-		return s.openDirFile(name, tenantID, path, root), nil
+		return s.openDirFile(name, tenantID, path, root)
 	}
 	if path == "" {
 		if writable {
@@ -61,7 +61,7 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 		if err != nil {
 			return nil, pathError("open", name, err)
 		}
-		return s.openDirFile(name, tenantID, path, false), nil
+		return s.openDirFile(name, tenantID, path, false)
 	}
 	info, err := s.vfsNodeInfo(tenantID, path)
 	if err != nil {
@@ -82,7 +82,7 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 			if writable {
 				return nil, pathError("open", name, ErrIsDir)
 			}
-			return s.openDirFile(name, tenantID, path, false), nil
+			return s.openDirFile(name, tenantID, path, false)
 		}
 		if flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0 {
 			return nil, exists("open", name)
@@ -93,7 +93,12 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 		if err != nil {
 			return nil, err
 		}
-		return &blobVFSFile{name: name, reader: reader, size: info.size, mode: info.mode, modTime: info.modTime}, nil
+		file := &blobVFSFile{store: s, name: name, reader: reader, size: info.size, mode: info.mode, modTime: info.modTime}
+		if err := s.registerHandle(file); err != nil {
+			_ = file.close(false)
+			return nil, err
+		}
+		return file, nil
 	}
 	session, sessionName, err := s.createWriteSession()
 	if err != nil {
@@ -134,7 +139,7 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 	if flag&os.O_APPEND != 0 {
 		offset = size
 	}
-	return &blobVFSFile{
+	file := &blobVFSFile{
 		store:          s,
 		ctx:            ctx,
 		name:           name,
@@ -151,7 +156,12 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 		dirty:          !info.exists || flag&(os.O_CREATE|os.O_TRUNC) != 0,
 		options:        options,
 		baseGeneration: baseGeneration,
-	}, nil
+	}
+	if err := s.registerHandle(file); err != nil {
+		_ = file.close(false)
+		return nil, err
+	}
+	return file, nil
 }
 
 // Mkdir creates a single directory. Creating a tenant root is supported by
@@ -529,7 +539,7 @@ func (s *Store) updateVFSMetadata(op, name string, edit func(*inodeRecord)) erro
 	return s.commitMetaLocked([]metaOp{{Type: "put_inode", Inode: next}})
 }
 
-func (s *Store) openDirFile(name, tenantID, path string, root bool) afero.File {
+func (s *Store) openDirFile(name, tenantID, path string, root bool) (afero.File, error) {
 	entries := s.listDir(tenantID, path, root)
 	info := blobFileInfo{name: filepath.Base(name), mode: os.ModeDir | 0o755, modTime: time.Now(), isDir: true}
 	if root {
@@ -544,7 +554,12 @@ func (s *Store) openDirFile(name, tenantID, path string, root bool) afero.File {
 		}
 		s.metaMu.RUnlock()
 	}
-	return &blobVFSFile{name: name, mode: info.mode, modTime: info.modTime, isDir: true, entries: entries}
+	file := &blobVFSFile{store: s, name: name, mode: info.mode, modTime: info.modTime, isDir: true, entries: entries}
+	if err := s.registerHandle(file); err != nil {
+		_ = file.close(false)
+		return nil, err
+	}
+	return file, nil
 }
 
 func (s *Store) listDir(tenantID, path string, root bool) []os.FileInfo {
