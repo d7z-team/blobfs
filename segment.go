@@ -114,13 +114,9 @@ func (w *segmentBatchWriter) appendChunk(scopeID, chunkID string, raw []byte) (c
 
 func (w *segmentBatchWriter) rotate() error {
 	if w.current != nil {
-		if err := w.current.file.Sync(); err != nil {
+		if err := w.closeCurrent(); err != nil {
 			return err
 		}
-		if err := w.current.file.Close(); err != nil {
-			return err
-		}
-		w.current = nil
 	}
 	seg := w.store.newSegmentRecord()
 	stagingPath := w.store.stagingSegmentPath(seg)
@@ -143,13 +139,9 @@ func (w *segmentBatchWriter) rotate() error {
 
 func (w *segmentBatchWriter) finish() error {
 	if w.current != nil {
-		if err := w.current.file.Sync(); err != nil {
+		if err := w.closeCurrent(); err != nil {
 			return err
 		}
-		if err := w.current.file.Close(); err != nil {
-			return err
-		}
-		w.current = nil
 	}
 	sealedAt := nowUnix()
 	published := make([]*segmentRecord, 0, len(w.segments))
@@ -168,6 +160,15 @@ func (w *segmentBatchWriter) finish() error {
 		published = append(published, seg)
 	}
 	return nil
+}
+
+func (w *segmentBatchWriter) closeCurrent() error {
+	if w.current == nil {
+		return nil
+	}
+	file := w.current.file
+	w.current = nil
+	return errors.Join(file.Sync(), file.Close())
 }
 
 func (w *segmentBatchWriter) removePublished(segments []*segmentRecord) error {

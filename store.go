@@ -712,21 +712,18 @@ func (s *Store) Close() error {
 		s.opWG.Wait()
 
 		s.metaMu.Lock()
-		if err := s.checkpointMetaLocked(); err != nil && closeErr == nil {
-			closeErr = err
-		}
+		closeErr = errors.Join(closeErr, s.checkpointMetaLocked())
 		if s.metaLog != nil {
-			if err := s.metaLog.Close(); err != nil && closeErr == nil {
-				closeErr = err
-			}
+			closeErr = errors.Join(closeErr, s.metaLog.Close())
 			s.metaLog = nil
 		}
 		s.metaMu.Unlock()
 		if s.lockFile != nil {
-			if err := s.lockFile.Close(); err != nil && closeErr == nil {
-				closeErr = err
+			closeErr = errors.Join(closeErr, s.lockFile.Close())
+			if err := s.fs.Remove(s.lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				closeErr = errors.Join(closeErr, err)
 			}
-			_ = s.fs.Remove(s.lockPath)
+			s.lockFile = nil
 		}
 	})
 	return closeErr
@@ -815,13 +812,19 @@ func (s *Store) checkpointMetaLocked() error {
 	s.metaLogName = newName
 	s.commitsSinceCheckpoint = 0
 	s.lastCheckpointErr = nil
+	var cleanupErr error
 	if oldLog != nil {
-		_ = oldLog.Close()
+		cleanupErr = errors.Join(cleanupErr, oldLog.Close())
 	}
 	if oldName != "" && oldName != newName {
-		_ = s.fs.Remove(filepath.Join(s.metaDir, "txlog", oldName))
+		if err := s.fs.Remove(filepath.Join(s.metaDir, "txlog", oldName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
 	}
-	return nil
+	if cleanupErr != nil {
+		s.lastCheckpointErr = cleanupErr
+	}
+	return cleanupErr
 }
 
 func (s *Store) createMetaLogGenerationLocked(startName string) (afero.File, string, error) {

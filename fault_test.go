@@ -3,6 +3,7 @@ package blobfs
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,7 +14,10 @@ import (
 	"github.com/spf13/afero"
 )
 
-var errInjectedFSFault = errors.New("injected filesystem fault")
+var (
+	errInjectedFSFault    = errors.New("injected filesystem fault")
+	errInjectedCloseFault = errors.New("injected close fault")
+)
 
 type faultFS struct {
 	afero.Fs
@@ -27,6 +31,7 @@ type faultFS struct {
 	renameFailures int
 	removeContains string
 	removeFailures int
+	closeFaults    map[string]int
 }
 
 func (f *faultFS) failWritesTo(suffix string, count int) {
@@ -59,6 +64,15 @@ func (f *faultFS) failRemovesContaining(fragment string, count int) {
 	f.mu.Lock()
 	f.removeContains = filepath.ToSlash(fragment)
 	f.removeFailures = count
+	f.mu.Unlock()
+}
+
+func (f *faultFS) failClosesTo(suffix string, count int) {
+	f.mu.Lock()
+	if f.closeFaults == nil {
+		f.closeFaults = map[string]int{}
+	}
+	f.closeFaults[filepath.ToSlash(suffix)] = count
 	f.mu.Unlock()
 }
 
@@ -122,6 +136,18 @@ func (f *faultFS) consumeSyncFault(name string) bool {
 	return false
 }
 
+func (f *faultFS) consumeCloseFault(name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for suffix, failures := range f.closeFaults {
+		if failures > 0 && strings.HasSuffix(name, suffix) {
+			f.closeFaults[suffix] = failures - 1
+			return true
+		}
+	}
+	return false
+}
+
 type faultFile struct {
 	afero.File
 	fs   *faultFS
@@ -140,6 +166,13 @@ func (f *faultFile) Sync() error {
 		return errInjectedFSFault
 	}
 	return f.File.Sync()
+}
+
+func (f *faultFile) Close() error {
+	if f.fs.consumeCloseFault(f.name) {
+		return fmt.Errorf("close %s: %w", f.name, errInjectedCloseFault)
+	}
+	return f.File.Close()
 }
 
 func countRegularFiles(t *testing.T, fsys afero.Fs, root string) int {
@@ -171,6 +204,36 @@ func simulateCrashWithoutCheckpoint(t *testing.T, store *Store) {
 	}
 	if err := store.fs.Remove(store.lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("remove lock: %v", err)
+	}
+}
+
+func TestStoreCloseJoinsMetadataLogLockAndRemoveErrors(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.MkdirAll("tenant-a/close", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	nextLog := nextMetaLogName(store.metaLogName)
+	fsys.failClosesTo(filepath.Join("meta", "txlog", nextLog), 1)
+	fsys.failClosesTo(filepath.Join("meta", "LOCK"), 1)
+	fsys.failRemovesContaining(filepath.Join("meta", "LOCK"), 1)
+
+	err = store.Close()
+	if !errors.Is(err, errInjectedCloseFault) {
+		t.Fatalf("close error missing close fault: %v", err)
+	}
+	if !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("close error missing remove fault: %v", err)
+	}
+	errText := err.Error()
+	if !strings.Contains(errText, nextLog) || !strings.Contains(errText, "LOCK") {
+		t.Fatalf("close error did not retain individual paths: %v", err)
+	}
+	if _, statErr := fsys.Stat(filepath.Join("/blobfs", "meta", "LOCK")); statErr != nil {
+		t.Fatalf("failed lock remove should leave lock for diagnosis: %v", statErr)
 	}
 }
 

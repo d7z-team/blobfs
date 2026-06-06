@@ -56,6 +56,52 @@ func TestSegmentRelativePathFanoutBoundaries(t *testing.T) {
 	}
 }
 
+func TestSegmentBatchWriterJoinsSyncAndCloseErrors(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	raw := []byte("segment writer close")
+	writer := &segmentBatchWriter{store: store}
+	if _, err := writer.appendChunk("", hashBytes("", false, raw), raw); err != nil {
+		t.Fatalf("append chunk: %v", err)
+	}
+	fsys.failSyncsTo(".blob", 1)
+	fsys.failClosesTo(".blob", 1)
+	err = writer.finish()
+	if !errors.Is(err, errInjectedFSFault) || !errors.Is(err, errInjectedCloseFault) {
+		t.Fatalf("finish error = %v, want sync and close faults", err)
+	}
+	if writer.current != nil {
+		t.Fatalf("current segment was not cleared after close attempt")
+	}
+	writer.cleanup()
+	if files := countRegularFiles(t, fsys, store.stagingDir); files != 0 {
+		t.Fatalf("staging files were not cleaned, count=%d", files)
+	}
+
+	rotateWriter := &segmentBatchWriter{store: store}
+	if _, err := rotateWriter.appendChunk("", hashBytes("", false, raw), raw); err != nil {
+		t.Fatalf("append chunk before rotate: %v", err)
+	}
+	fsys.failSyncsTo(".blob", 1)
+	fsys.failClosesTo(".blob", 1)
+	err = rotateWriter.rotate()
+	if !errors.Is(err, errInjectedFSFault) || !errors.Is(err, errInjectedCloseFault) {
+		t.Fatalf("rotate error = %v, want sync and close faults", err)
+	}
+	if rotateWriter.current != nil {
+		t.Fatalf("current segment was not cleared after rotate close attempt")
+	}
+	rotateWriter.cleanup()
+	if files := countRegularFiles(t, fsys, store.stagingDir); files != 0 {
+		t.Fatalf("rotate staging files were not cleaned, count=%d", files)
+	}
+}
+
 func TestReadPathRejectsChunkHashMismatch(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/hash", 0o755); err != nil {
