@@ -155,7 +155,7 @@ func markCompactionCandidatesForTest(t *testing.T, store *Store) ([]compactCandi
 		store.metaMu.Unlock()
 		t.Fatalf("mark garbage: %v", err)
 	}
-	candidates := store.collectCompactCandidatesLocked()
+	candidates, _ := store.collectSegmentWorkLocked(now, true)
 	ops = ops[:0]
 	for _, candidate := range candidates {
 		next := candidate.Source
@@ -381,6 +381,45 @@ func TestRunGCCompactTrueDeletesFullyDeadSegments(t *testing.T) {
 	}
 	if result.SegmentsDeleted == 0 {
 		t.Fatalf("dead segment was not deleted with Compact=true: %+v", result)
+	}
+}
+
+func TestGCCollectSegmentWorkFindsCompactionAndDeadSegments(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/gcwork", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := make([]byte, 768)
+	for i := range data {
+		data[i] = byte(i*11 + i/5)
+	}
+	putTestBytes(t, store, "tenant-a", "gcwork/source", data)
+	livePayload, _ := firstChunkPayload(t, store, "tenant-a", "gcwork/source")
+	putTestBytes(t, store, "tenant-a", "gcwork/live", livePayload)
+	putTestBytes(t, store, "tenant-a", "gcwork/dead", bytes.Repeat([]byte("dead"), 64))
+	if err := store.DeleteObject(testContext(t), "tenant-a", "gcwork/source"); err != nil {
+		t.Fatalf("delete source: %v", err)
+	}
+	if err := store.DeleteObject(testContext(t), "tenant-a", "gcwork/dead"); err != nil {
+		t.Fatalf("delete dead: %v", err)
+	}
+
+	now := nowUnix()
+	store.metaMu.Lock()
+	ops := []metaOp{}
+	result := &GCResult{}
+	store.markUnreferencedChunksLocked(now, now+int64(time.Second), 1, result, &ops)
+	if err := store.commitMetaLocked(ops); err != nil {
+		store.metaMu.Unlock()
+		t.Fatalf("mark garbage: %v", err)
+	}
+	candidates, dead := store.collectSegmentWorkLocked(now, true)
+	store.metaMu.Unlock()
+	if len(candidates) == 0 {
+		t.Fatal("expected compaction candidate from partially dead segment")
+	}
+	if len(dead) == 0 {
+		t.Fatal("expected fully dead segment")
 	}
 }
 
@@ -627,8 +666,21 @@ func TestPublicAPIVFSSmokeAndBoundaries(t *testing.T) {
 	if string(buf) != "abc" {
 		t.Fatalf("reader seek data = %q", buf)
 	}
-	if tenantData, err := fs.ReadFile(store.TenantFS("tenant-a"), "api/blob"); err != nil || !bytes.Equal(tenantData, data) {
+	tenantFS := store.TenantFS("tenant-a")
+	if _, ok := tenantFS.(fs.StatFS); !ok {
+		t.Fatal("tenant fs should implement fs.StatFS")
+	}
+	if _, ok := tenantFS.(fs.ReadDirFS); !ok {
+		t.Fatal("tenant fs should implement fs.ReadDirFS")
+	}
+	if tenantData, err := fs.ReadFile(tenantFS, "api/blob"); err != nil || !bytes.Equal(tenantData, data) {
 		t.Fatalf("tenant fs read = %q, %v", tenantData, err)
+	}
+	if stat, err := fs.Stat(tenantFS, "api/blob"); err != nil || stat.Size() != int64(len(data)) {
+		t.Fatalf("tenant fs stat = %+v, %v", stat, err)
+	}
+	if entries, err := fs.ReadDir(tenantFS, "api"); err != nil || len(entries) != 1 || entries[0].Name() != "blob" {
+		t.Fatalf("tenant fs readdir = %+v, %v", entries, err)
 	}
 
 	file, err := store.OpenFile("tenant-a/api/vfs.txt", os.O_CREATE|os.O_RDWR, 0o755)

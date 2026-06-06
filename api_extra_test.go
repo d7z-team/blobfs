@@ -244,6 +244,71 @@ func TestHotObjectReaderAndVFSFileBoundaries(t *testing.T) {
 	}
 }
 
+func TestVFSReadOnlyFileStreamsFromObjectReader(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/stream", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := make([]byte, 2048)
+	for i := range data {
+		data[i] = byte(i*17 + i/3)
+	}
+	putTestBytes(t, store, "tenant-a", "stream/large.bin", data)
+
+	file, err := store.OpenFile("tenant-a/stream/large.bin", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("open read-only vfs: %v", err)
+	}
+	vfsFile := file.(*blobVFSFile)
+	if vfsFile.reader == nil || vfsFile.session != nil || vfsFile.fileSizeLocked() != int64(len(data)) {
+		_ = file.Close()
+		t.Fatalf("read-only vfs file is not backed by object reader: %+v", vfsFile)
+	}
+	if _, err := vfsFile.Seek(10, io.SeekStart); err != nil {
+		_ = file.Close()
+		t.Fatalf("seek: %v", err)
+	}
+	buf := make([]byte, 31)
+	if n, err := vfsFile.ReadAt(buf, 97); err != nil || n != len(buf) || !bytes.Equal(buf, data[97:128]) {
+		_ = file.Close()
+		t.Fatalf("readat = %d, %v, data match=%v", n, err, bytes.Equal(buf, data[97:128]))
+	}
+	seq := make([]byte, 16)
+	if n, err := vfsFile.Read(seq); err != nil || n != len(seq) || !bytes.Equal(seq, data[10:26]) {
+		_ = file.Close()
+		t.Fatalf("read after readat = %d, %v, data match=%v", n, err, bytes.Equal(seq, data[10:26]))
+	}
+	if _, err := vfsFile.Seek(int64(len(data)+100), io.SeekStart); err != nil {
+		_ = file.Close()
+		t.Fatalf("seek past eof: %v", err)
+	}
+	if n, err := vfsFile.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		_ = file.Close()
+		t.Fatalf("read after seek past eof = %d, %v", n, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close read-only vfs: %v", err)
+	}
+}
+
+func TestBlobVFSFileCloseJoinsSyncAndSessionErrors(t *testing.T) {
+	syncErr := errors.New("injected sync failure")
+	closeErr := errors.New("injected close failure")
+	file := &blobVFSFile{
+		store:    &Store{},
+		session:  &faultCloseFile{seekErr: syncErr, closeErr: closeErr},
+		writable: true,
+		dirty:    true,
+	}
+	err := file.Close()
+	if !errors.Is(err, syncErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("close error = %v, want sync and close errors", err)
+	}
+	if !file.closed || file.session != nil {
+		t.Fatalf("file was not closed cleanly: closed=%v session=%v", file.closed, file.session)
+	}
+}
+
 func TestVFSTenantRootExistsAndKeepsMetadata(t *testing.T) {
 	store := openTestStore(t)
 	if _, err := store.Open("tenant-missing"); !errors.Is(err, fs.ErrNotExist) {
@@ -282,6 +347,20 @@ func TestVFSTenantRootExistsAndKeepsMetadata(t *testing.T) {
 	if root == nil || root.ATime != atime.UnixNano() {
 		t.Fatalf("tenant root atime not stored: %+v", root)
 	}
+}
+
+type faultCloseFile struct {
+	afero.File
+	seekErr  error
+	closeErr error
+}
+
+func (f *faultCloseFile) Seek(int64, int) (int64, error) {
+	return 0, f.seekErr
+}
+
+func (f *faultCloseFile) Close() error {
+	return f.closeErr
 }
 
 func TestPublicAPIOpenFSReopenSmoke(t *testing.T) {

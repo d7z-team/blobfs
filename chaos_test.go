@@ -2,6 +2,7 @@ package blobfs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestChaosDeterministicOperationsMaintainInvariants(t *testing.T) {
@@ -344,6 +346,68 @@ func TestChaosPutReuseInterleavedWithAggressiveGC(t *testing.T) {
 	}
 	if !scrub.Healthy {
 		t.Fatalf("scrub found issues: %+v", scrub)
+	}
+}
+
+func TestChaosScrubRunsThroughConcurrentDeletesAndGC(t *testing.T) {
+	cfg := testConfig()
+	cfg.SegmentSize = 512
+	cfg.GC.CompactGarbageRatio = 0.2
+	store, err := Open(t.TempDir(), cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/scrub", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	for i := 0; i < 32; i++ {
+		data := bytes.Repeat([]byte{byte(i), byte(i * 7)}, 128)
+		putTestBytes(t, store, "tenant-a", fmt.Sprintf("scrub/file-%02d", i), data)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		result, err := store.Scrub(ctx, ScrubOptions{CheckFiles: true})
+		if err != nil {
+			done <- err
+			return
+		}
+		if !result.Healthy {
+			done <- fmt.Errorf("scrub reported issues: %+v", result.Issues)
+			return
+		}
+		done <- nil
+	}()
+	for i := 0; i < 16; i++ {
+		if err := store.DeleteObject(testContext(t), "tenant-a", fmt.Sprintf("scrub/file-%02d", i)); err != nil {
+			t.Fatalf("delete during scrub: %v", err)
+		}
+		if i%4 == 0 {
+			if _, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
+				t.Fatalf("gc during scrub: %v", err)
+			}
+		}
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("concurrent scrub: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent scrub did not finish")
+	}
+	if _, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
+		t.Fatalf("final gc: %v", err)
+	}
+	scrub, err := store.Scrub(testContext(t), ScrubOptions{CheckFiles: true})
+	if err != nil {
+		t.Fatalf("final scrub: %v", err)
+	}
+	if !scrub.Healthy || scrub.CheckedFiles != 16 {
+		t.Fatalf("bad final scrub: %+v", scrub)
 	}
 }
 

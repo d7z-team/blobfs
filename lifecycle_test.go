@@ -309,6 +309,54 @@ func TestScrubCheckFilesCompletesAfterCloseStarts(t *testing.T) {
 	}
 }
 
+func TestScrubCheckFilesKeepsOpenedSnapshotAfterDelete(t *testing.T) {
+	fsys := &blockingOpenFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/scrub", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "scrub/blob", bytes.Repeat([]byte("snapshot"), 32))
+	_, segmentPath := firstSegmentPath(t, store)
+	fsys.blockOpensTo(filepath.Base(segmentPath))
+	defer fsys.releaseBlocked()
+
+	type scrubOutcome struct {
+		result *ScrubResult
+		err    error
+	}
+	done := make(chan scrubOutcome, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		result, err := store.Scrub(ctx, ScrubOptions{CheckFiles: true})
+		done <- scrubOutcome{result: result, err: err}
+	}()
+	select {
+	case <-fsys.entered:
+	case <-time.After(time.Second):
+		t.Fatal("scrub did not start segment read")
+	}
+	if err := store.DeleteObject(testContext(t), "tenant-a", "scrub/blob"); err != nil {
+		t.Fatalf("delete during scrub: %v", err)
+	}
+	fsys.releaseBlocked()
+	select {
+	case outcome := <-done:
+		if outcome.err != nil {
+			t.Fatalf("scrub after delete: %v", outcome.err)
+		}
+		if outcome.result == nil || !outcome.result.Healthy || outcome.result.CheckedFiles != 1 {
+			t.Fatalf("scrub did not use opened file snapshot: %+v", outcome.result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("scrub did not finish")
+	}
+}
+
 func TestStartBackgroundRejectsReentry(t *testing.T) {
 	store := openTestStore(t)
 	ctx, cancel := context.WithCancel(context.Background())

@@ -90,12 +90,7 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 		if err != nil {
 			return nil, err
 		}
-		data, err := io.ReadAll(reader)
-		_ = reader.Close()
-		if err != nil {
-			return nil, err
-		}
-		return &blobVFSFile{name: name, data: data, mode: info.mode, modTime: info.modTime}, nil
+		return &blobVFSFile{name: name, reader: reader, size: info.size, mode: info.mode, modTime: info.modTime}, nil
 	}
 	session, sessionName, err := s.createWriteSession()
 	if err != nil {
@@ -677,6 +672,7 @@ type vfsNodeInfo struct {
 	exists     bool
 	isDir      bool
 	generation uint64
+	size       int64
 	mode       os.FileMode
 	modTime    time.Time
 	options    map[string]string
@@ -694,6 +690,7 @@ func (s *Store) vfsNodeInfo(tenantID, path string) (vfsNodeInfo, error) {
 		exists:     true,
 		isDir:      inode.Kind == fileKindDir,
 		generation: inode.Generation,
+		size:       inode.Size,
 		mode:       info.mode,
 		modTime:    info.modTime,
 		options:    copyOptions(inode.Options),

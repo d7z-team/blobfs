@@ -23,6 +23,15 @@ type chunkCheckSnapshot struct {
 	HasSeg   bool
 }
 
+type fileCheckSnapshot struct {
+	TenantID string
+	Path     string
+	FileHash string
+	Size     int64
+	ScopeID  string
+	Chunks   []chunkCheckSnapshot
+}
+
 // CheckObject verifies one active object from metadata references through chunk and file hashes.
 func (s *Store) CheckObject(ctx context.Context, tenantID, path string) (*CheckResult, error) {
 	if err := s.beginOp(ctx); err != nil {
@@ -43,10 +52,15 @@ func (s *Store) checkObject(ctx context.Context, tenantID, path string) (*CheckR
 	if err != nil {
 		return nil, pathError("check", path, err)
 	}
-	snapshots, fileHash, fileSize, scopeID, err := s.checkSnapshots(tenantID, path)
+	snapshots, fileHash, fileSize, scopeID, pinned, err := s.checkSnapshots(tenantID, path)
 	if err != nil {
 		return nil, pathError("check", path, err)
 	}
+	defer func() {
+		for _, segmentID := range pinned {
+			s.unpinSegment(segmentID)
+		}
+	}()
 	result := &CheckResult{TenantID: tenantID, Path: path, Healthy: true}
 	contentHash := scopedHasher(scopeID, scopeID != "")
 	var contentSize int64
@@ -89,25 +103,27 @@ func (s *Store) checkObject(ctx context.Context, tenantID, path string) (*CheckR
 	return result, nil
 }
 
-func (s *Store) checkSnapshots(tenantID, path string) ([]chunkCheckSnapshot, string, int64, string, error) {
+func (s *Store) checkSnapshots(tenantID, path string) ([]chunkCheckSnapshot, string, int64, string, []string, error) {
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
 	inode, err := s.resolvePathLocked(tenantID, path)
 	if err != nil {
-		return nil, "", 0, "", err
+		return nil, "", 0, "", nil, err
 	}
 	if inode.Kind != fileKindFile {
-		return nil, "", 0, "", ErrIsDir
+		return nil, "", 0, "", nil, ErrIsDir
 	}
 	manifest := s.meta.Manifests[inode.ManifestID]
 	if manifest == nil {
-		return nil, "", 0, "", errors.New("manifest not found")
+		return nil, "", 0, "", nil, errors.New("manifest not found")
 	}
 	refs := append([]manifestChunk(nil), manifest.Chunks...)
 	sort.Slice(refs, func(i, j int) bool {
 		return refs[i].FileOffset < refs[j].FileOffset
 	})
 	snapshots := make([]chunkCheckSnapshot, 0, len(refs))
+	var pinned []string
+	seenPins := map[string]bool{}
 	for _, ref := range refs {
 		snap := chunkCheckSnapshot{TenantID: tenantID, Path: path, Ref: ref}
 		chunk := s.meta.Chunks[ref.ChunkID]
@@ -118,11 +134,16 @@ func (s *Store) checkSnapshots(tenantID, path string) ([]chunkCheckSnapshot, str
 			if seg != nil {
 				snap.Segment = *seg
 				snap.HasSeg = true
+				if !seenPins[seg.SegmentID] {
+					seenPins[seg.SegmentID] = true
+					s.pinSegment(seg.SegmentID)
+					pinned = append(pinned, seg.SegmentID)
+				}
 			}
 		}
 		snapshots = append(snapshots, snap)
 	}
-	return snapshots, inode.FileHash, inode.Size, s.dedupScopeID(tenantID), nil
+	return snapshots, inode.FileHash, inode.Size, s.dedupScopeID(tenantID), pinned, nil
 }
 
 // Scrub verifies stored chunks and optionally active file hashes across the whole store.
@@ -133,44 +154,97 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 	defer s.endOp()
 
 	s.metaMu.RLock()
-	chunkIDs := make([]string, 0, len(s.meta.Chunks))
-	for chunkID, chunk := range s.meta.Chunks {
+	snapshots := make([]chunkCheckSnapshot, 0, len(s.meta.Chunks))
+	var fileSnapshots []fileCheckSnapshot
+	var metadataIssues []CheckIssue
+	var pinned []string
+	seenPins := map[string]bool{}
+	for _, chunk := range s.meta.Chunks {
 		if chunk == nil || chunk.State == chunkStateDeleted || chunk.SegmentID == "" {
-			continue
-		}
-		chunkIDs = append(chunkIDs, chunkID)
-	}
-	fileIDs := make([]uint64, 0, len(s.meta.Inodes))
-	if opts.CheckFiles {
-		for inodeID, inode := range s.meta.Inodes {
-			if inode != nil && inode.State == fileStateActive && inode.Kind == fileKindFile {
-				fileIDs = append(fileIDs, inodeID)
-			}
-		}
-	}
-	s.metaMu.RUnlock()
-
-	result := &ScrubResult{Healthy: true}
-	seenSegments := map[string]bool{}
-	seenCorruptChunks := map[string]bool{}
-	seenCorruptSegments := map[string]bool{}
-	seenAffected := map[string]bool{}
-	for _, chunkID := range chunkIDs {
-		if err := contextError(ctx); err != nil {
-			return result, err
-		}
-		s.metaMu.RLock()
-		chunk := s.meta.Chunks[chunkID]
-		if chunk == nil || chunk.State == chunkStateDeleted || chunk.SegmentID == "" {
-			s.metaMu.RUnlock()
 			continue
 		}
 		snap := chunkCheckSnapshot{Chunk: *chunk, HasChunk: true}
 		if seg := s.meta.Segments[chunk.SegmentID]; seg != nil {
 			snap.Segment = *seg
 			snap.HasSeg = true
+			if !seenPins[seg.SegmentID] {
+				seenPins[seg.SegmentID] = true
+				s.pinSegment(seg.SegmentID)
+				pinned = append(pinned, seg.SegmentID)
+			}
 		}
-		s.metaMu.RUnlock()
+		snapshots = append(snapshots, snap)
+	}
+	if opts.CheckFiles {
+		for inodeID, inode := range s.meta.Inodes {
+			if inode == nil || inode.State != fileStateActive || inode.Kind != fileKindFile {
+				continue
+			}
+			path, pathErr := s.pathForInodeLocked(inodeID)
+			if pathErr != nil {
+				metadataIssues = append(metadataIssues, CheckIssue{Kind: "inode_parent_invalid", ID: inodeFileID(inodeID), TenantID: inode.TenantID, Reason: pathErr.Error()})
+				continue
+			}
+			manifest := s.meta.Manifests[inode.ManifestID]
+			if manifest == nil {
+				metadataIssues = append(metadataIssues, CheckIssue{Kind: "manifest_missing", ID: inode.ManifestID, Path: path, TenantID: inode.TenantID, Reason: "manifest metadata is missing"})
+				continue
+			}
+			refs := append([]manifestChunk(nil), manifest.Chunks...)
+			sort.Slice(refs, func(i, j int) bool {
+				return refs[i].FileOffset < refs[j].FileOffset
+			})
+			fileSnap := fileCheckSnapshot{
+				TenantID: inode.TenantID,
+				Path:     path,
+				FileHash: inode.FileHash,
+				Size:     inode.Size,
+				ScopeID:  s.dedupScopeID(inode.TenantID),
+				Chunks:   make([]chunkCheckSnapshot, 0, len(refs)),
+			}
+			for _, ref := range refs {
+				snap := chunkCheckSnapshot{TenantID: inode.TenantID, Path: path, Ref: ref}
+				chunk := s.meta.Chunks[ref.ChunkID]
+				if chunk != nil {
+					snap.Chunk = *chunk
+					snap.HasChunk = true
+					if seg := s.meta.Segments[chunk.SegmentID]; seg != nil {
+						snap.Segment = *seg
+						snap.HasSeg = true
+						if !seenPins[seg.SegmentID] {
+							seenPins[seg.SegmentID] = true
+							s.pinSegment(seg.SegmentID)
+							pinned = append(pinned, seg.SegmentID)
+						}
+					}
+				}
+				fileSnap.Chunks = append(fileSnap.Chunks, snap)
+			}
+			fileSnapshots = append(fileSnapshots, fileSnap)
+		}
+	}
+	s.metaMu.RUnlock()
+	defer func() {
+		for _, segmentID := range pinned {
+			s.unpinSegment(segmentID)
+		}
+	}()
+
+	result := &ScrubResult{Healthy: true}
+	seenSegments := map[string]bool{}
+	seenCorruptChunks := map[string]bool{}
+	seenCorruptSegments := map[string]bool{}
+	seenAffected := map[string]bool{}
+	for _, issue := range metadataIssues {
+		result.Issues = append(result.Issues, issue)
+		if issue.TenantID != "" && issue.Path != "" {
+			seenAffected[issue.TenantID+"/"+issue.Path] = true
+		}
+	}
+	for _, snap := range snapshots {
+		if err := contextError(ctx); err != nil {
+			return result, err
+		}
 		raw, issue := s.checkChunkSnapshot(snap)
 		result.CheckedChunks++
 		if snap.HasSeg && !seenSegments[snap.Segment.SegmentID] {
@@ -194,28 +268,44 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 			seenCorruptSegments[issue.SegmentID] = true
 		}
 	}
-	for _, fileID := range fileIDs {
-		s.metaMu.RLock()
-		inode := s.meta.Inodes[fileID]
-		if inode == nil || inode.State != fileStateActive || inode.Kind != fileKindFile {
-			s.metaMu.RUnlock()
-			continue
-		}
-		tenantID := inode.TenantID
-		path, pathErr := s.pathForInodeLocked(fileID)
-		s.metaMu.RUnlock()
-		result.CheckedFiles++
-		if pathErr != nil {
-			result.Issues = append(result.Issues, CheckIssue{Kind: "inode_parent_invalid", ID: inodeFileID(fileID), TenantID: tenantID, Reason: pathErr.Error()})
-			continue
-		}
-		check, err := s.checkObject(ctx, tenantID, path)
-		if err != nil && !errors.Is(err, ErrCorrupt) {
+	for _, fileSnap := range fileSnapshots {
+		if err := contextError(ctx); err != nil {
 			return result, err
 		}
-		if check != nil && len(check.Issues) > 0 {
-			result.Issues = append(result.Issues, check.Issues...)
-			seenAffected[tenantID+"/"+path] = true
+		result.CheckedFiles++
+		contentHash := scopedHasher(fileSnap.ScopeID, fileSnap.ScopeID != "")
+		var contentSize int64
+		var fileIssues []CheckIssue
+		for _, snap := range fileSnap.Chunks {
+			raw, issue := s.checkChunkSnapshot(snap)
+			if issue != nil {
+				fileIssues = append(fileIssues, *issue)
+				continue
+			}
+			contentHash.Write(raw)
+			contentSize += int64(len(raw))
+		}
+		if len(fileIssues) == 0 {
+			gotHash := hex.EncodeToString(contentHash.Sum(nil))
+			if gotHash != fileSnap.FileHash || contentSize != fileSnap.Size {
+				fileIssues = append(fileIssues, CheckIssue{
+					Kind:     "file_hash_mismatch",
+					ID:       fileSnap.FileHash,
+					Path:     fileSnap.Path,
+					TenantID: fileSnap.TenantID,
+					Reason:   "file content hash or size mismatch",
+				})
+			}
+		}
+		for _, issue := range fileIssues {
+			result.Issues = append(result.Issues, issue)
+			if issue.ChunkID != "" {
+				seenCorruptChunks[issue.ChunkID] = true
+			}
+			if issue.SegmentID != "" {
+				seenCorruptSegments[issue.SegmentID] = true
+			}
+			seenAffected[fileSnap.TenantID+"/"+fileSnap.Path] = true
 		}
 	}
 	for id := range seenCorruptChunks {
@@ -286,9 +376,7 @@ func (s *Store) checkChunkSnapshot(snap chunkCheckSnapshot) ([]byte, *CheckIssue
 	if snap.Segment.State == segmentStateCorrupt {
 		return nil, &CheckIssue{Kind: "segment_corrupt", Path: snap.Path, TenantID: snap.TenantID, ChunkID: snap.Chunk.ChunkID, SegmentID: snap.Segment.SegmentID, Reason: snap.Segment.CorruptReason}
 	}
-	s.pinSegment(snap.Segment.SegmentID)
 	raw, err := s.readChunkPayloadAt(snap.Segment, snap.Chunk)
-	s.unpinSegment(snap.Segment.SegmentID)
 	if err != nil {
 		kind := "chunk_read_failed"
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {

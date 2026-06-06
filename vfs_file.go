@@ -20,7 +20,7 @@ type blobVFSFile struct {
 	name           string
 	tenantID       string
 	path           string
-	data           []byte
+	reader         *ObjectReader
 	session        afero.File
 	sessionName    string
 	size           int64
@@ -46,18 +46,23 @@ func (f *blobVFSFile) Close() error {
 	}
 	err := f.syncLocked()
 	f.closed = true
+	reader := f.reader
 	session := f.session
 	store := f.store
 	sessionName := f.sessionName
+	f.reader = nil
 	f.session = nil
 	f.mu.Unlock()
 
+	if reader != nil {
+		err = errors.Join(err, reader.Close())
+	}
 	if session != nil {
-		if closeErr := session.Close(); err == nil {
-			err = closeErr
-		}
+		err = errors.Join(err, session.Close())
 		if store != nil && sessionName != "" {
-			_ = store.fs.Remove(sessionName)
+			if removeErr := store.fs.Remove(sessionName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				err = errors.Join(err, removeErr)
+			}
 			store.writeSessionMu.Lock()
 			store.openWriteSessions--
 			store.writeSessionMu.Unlock()
@@ -115,11 +120,20 @@ func (f *blobVFSFile) readAtLocked(p []byte, off int64) (int, error) {
 		}
 		return n, err
 	}
-	n := copy(p, f.data[off:])
-	if n < len(p) {
-		return n, io.EOF
+	if f.reader != nil {
+		if _, err := f.reader.Seek(off, io.SeekStart); err != nil {
+			return 0, err
+		}
+		n, err := io.ReadFull(f.reader, p)
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			err = io.EOF
+		}
+		if _, seekErr := f.reader.Seek(f.offset, io.SeekStart); seekErr != nil && err == nil {
+			err = seekErr
+		}
+		return n, err
 	}
-	return n, nil
+	return 0, io.EOF
 }
 
 func (f *blobVFSFile) Write(p []byte) (int, error) {
@@ -326,7 +340,10 @@ func (f *blobVFSFile) fileSizeLocked() int64 {
 	if f.session != nil {
 		return f.size
 	}
-	return int64(len(f.data))
+	if f.reader != nil {
+		return f.size
+	}
+	return 0
 }
 
 type blobFileInfo struct {
