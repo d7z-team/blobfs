@@ -219,7 +219,7 @@ func RemoveStaleLock(baseDir string) error {
 // The caller must first ensure no live process is using the store.
 func RemoveFSStaleLock(filesystem afero.Fs, baseDir string) error {
 	if filesystem == nil {
-		return errors.New("filesystem is nil")
+		return ErrNilFilesystem
 	}
 	err := filesystem.Remove(filepath.Join(filepath.Clean(baseDir), "meta", "LOCK"))
 	if errors.Is(err, fs.ErrNotExist) {

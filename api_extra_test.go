@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -25,8 +24,8 @@ func TestPublicAPINilContextAndErrorCases(t *testing.T) {
 	var nilCtx context.Context
 	assertNilContext := func(name string, err error) {
 		t.Helper()
-		if err == nil || !strings.Contains(err.Error(), "context is nil") {
-			t.Fatalf("%s error = %v, want context is nil", name, err)
+		if !errors.Is(err, ErrNilContext) {
+			t.Fatalf("%s error = %v, want ErrNilContext", name, err)
 		}
 	}
 	_, err := store.Put(nilCtx, "tenant-a", "api/other", bytes.NewReader(nil), nil)
@@ -56,8 +55,8 @@ func TestPublicAPINilContextAndErrorCases(t *testing.T) {
 	if _, err := store.Put(testContext(t), "tenant-a", "missing-parent/blob", bytes.NewReader(nil), nil); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Put missing parent = %v, want not exist", err)
 	}
-	if _, err := store.OpenRange(testContext(t), "tenant-a", "api/blob", -1, 1); err == nil {
-		t.Fatal("OpenRange negative offset should fail")
+	if _, err := store.OpenRange(testContext(t), "tenant-a", "api/blob", -1, 1); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("OpenRange negative offset = %v, want ErrInvalidRange", err)
 	}
 	if _, err := store.StatObject(testContext(t), "tenant-a", "api"); !errors.Is(err, ErrIsDir) {
 		t.Fatalf("StatObject directory = %v, want ErrIsDir", err)
@@ -68,8 +67,20 @@ func TestPublicAPINilContextAndErrorCases(t *testing.T) {
 	if err := store.DeleteObject(testContext(t), "tenant-a", "api"); !errors.Is(err, ErrIsDir) {
 		t.Fatalf("DeleteObject directory = %v, want ErrIsDir", err)
 	}
-	if _, err := OpenFS(nil, "/blobfs", testConfig()); err == nil {
-		t.Fatal("OpenFS nil filesystem should fail")
+	if _, err := store.Put(testContext(t), "tenant-a", "api/nil-reader", nil, nil); !errors.Is(err, ErrNilReader) {
+		t.Fatalf("Put nil reader = %v, want ErrNilReader", err)
+	}
+	if _, err := OpenFS(nil, "/blobfs", testConfig()); !errors.Is(err, ErrNilFilesystem) {
+		t.Fatalf("OpenFS nil filesystem = %v, want ErrNilFilesystem", err)
+	}
+}
+
+func TestStableErrorsUseStandardErrorsOnlyWhenExact(t *testing.T) {
+	if errMetadataLogClosed != fs.ErrClosed {
+		t.Fatalf("metadata log closed error = %v, want fs.ErrClosed", errMetadataLogClosed)
+	}
+	if errManifestNotFound != fs.ErrNotExist {
+		t.Fatalf("manifest not found error = %v, want fs.ErrNotExist", errManifestNotFound)
 	}
 }
 
@@ -101,20 +112,20 @@ func TestHotObjectReaderAndVFSFileBoundaries(t *testing.T) {
 	if pos, err := reader.Seek(int64(len(data)+100), io.SeekStart); err != nil || pos != int64(len(data)) {
 		t.Fatalf("seek past end = %d, %v", pos, err)
 	}
-	if _, err := reader.Seek(-1, io.SeekStart); err == nil {
-		t.Fatal("negative reader seek should fail")
+	if _, err := reader.Seek(-1, io.SeekStart); !errors.Is(err, ErrInvalidSeek) {
+		t.Fatalf("negative reader seek = %v, want ErrInvalidSeek", err)
 	}
-	if _, err := reader.Seek(0, 99); err == nil {
-		t.Fatal("invalid reader seek whence should fail")
+	if _, err := reader.Seek(0, 99); !errors.Is(err, ErrInvalidSeek) {
+		t.Fatalf("invalid reader seek whence = %v, want ErrInvalidSeek", err)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatalf("close reader: %v", err)
 	}
-	if _, err := reader.Read(make([]byte, 1)); err == nil {
-		t.Fatal("closed reader read should fail")
+	if _, err := reader.Read(make([]byte, 1)); !errors.Is(err, ErrReaderClosed) {
+		t.Fatalf("closed reader read = %v, want ErrReaderClosed", err)
 	}
-	if _, err := reader.Seek(0, io.SeekStart); err == nil {
-		t.Fatal("closed reader seek should fail")
+	if _, err := reader.Seek(0, io.SeekStart); !errors.Is(err, ErrReaderClosed) {
+		t.Fatalf("closed reader seek = %v, want ErrReaderClosed", err)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatalf("second reader close: %v", err)

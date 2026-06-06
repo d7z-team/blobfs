@@ -114,8 +114,8 @@ func TestRemoveStaleLockAllowsExplicitReopen(t *testing.T) {
 	if _, err := OpenFS(fsys, "/blobfs", testConfig()); err == nil {
 		t.Fatal("stale lock should prevent reopen")
 	}
-	if err := RemoveFSStaleLock(nil, "/blobfs"); err == nil {
-		t.Fatal("nil filesystem should fail")
+	if err := RemoveFSStaleLock(nil, "/blobfs"); !errors.Is(err, ErrNilFilesystem) {
+		t.Fatalf("nil filesystem = %v, want ErrNilFilesystem", err)
 	}
 	if err := RemoveFSStaleLock(fsys, "/blobfs"); err != nil {
 		t.Fatalf("remove stale lock: %v", err)

@@ -325,7 +325,7 @@ func replayMetaLog(fs afero.Fs, path string, meta *metadata) (metadataLoadReport
 
 func writeMetaTx(file afero.File, tx metaTx) error {
 	if file == nil {
-		return errors.New("metadata log is not open")
+		return errMetadataLogClosed
 	}
 	payload, err := json.Marshal(tx)
 	if err != nil {

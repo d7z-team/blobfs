@@ -1,7 +1,6 @@
 package blobfs
 
 import (
-	"errors"
 	"io"
 	"sort"
 	"sync"
@@ -50,7 +49,7 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 	}
 	manifest := s.meta.Manifests[inode.ManifestID]
 	if manifest == nil || manifest.State == manifestStateDeleted {
-		return nil, errors.New("manifest not found")
+		return nil, errManifestNotFound
 	}
 	refs := append([]manifestChunk(nil), manifest.Chunks...)
 	sort.Slice(refs, func(i, j int) bool {
@@ -60,11 +59,11 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 	for _, ref := range refs {
 		chunk := s.meta.Chunks[ref.ChunkID]
 		if chunk == nil || chunk.State == chunkStateDeleted || chunk.State == chunkStateCorrupt {
-			return nil, errors.New("chunk not readable")
+			return nil, errChunkNotReadable
 		}
 		seg := s.meta.Segments[chunk.SegmentID]
 		if seg == nil || seg.State == segmentStateDeleted || seg.State == segmentStateCorrupt {
-			return nil, errors.New("chunk not readable")
+			return nil, errChunkNotReadable
 		}
 		snapshots = append(snapshots, chunkSnapshot{Ref: ref, Chunk: *chunk, Segment: *seg})
 	}
@@ -110,7 +109,7 @@ func (r *ObjectReader) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return 0, errors.New("reader is closed")
+		return 0, ErrReaderClosed
 	}
 	if len(p) == 0 {
 		return 0, nil
@@ -153,7 +152,7 @@ func (r *ObjectReader) Seek(offset int64, whence int) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return 0, errors.New("reader is closed")
+		return 0, ErrReaderClosed
 	}
 	var next int64
 	switch whence {
@@ -164,10 +163,10 @@ func (r *ObjectReader) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekEnd:
 		next = r.size + offset
 	default:
-		return 0, errors.New("invalid seek whence")
+		return 0, ErrInvalidSeek
 	}
 	if next < 0 {
-		return 0, errors.New("negative seek offset")
+		return 0, ErrInvalidSeek
 	}
 	if next > r.limitEnd {
 		next = r.limitEnd

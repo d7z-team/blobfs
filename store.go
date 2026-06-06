@@ -60,9 +60,6 @@ type Store struct {
 	closed    chan struct{}
 }
 
-// ErrBackgroundRunning is returned when background workers are already active.
-var ErrBackgroundRunning = errors.New("background workers are already running")
-
 // PutResult describes the committed file record and manifest created or reused by Put.
 type PutResult struct {
 	FileID       string
@@ -137,7 +134,7 @@ func Open(baseDir string, cfg Config) (*Store, error) {
 // OpenFS opens a store rooted at baseDir on the provided afero filesystem.
 func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 	if fs == nil {
-		return nil, errors.New("filesystem is nil")
+		return nil, ErrNilFilesystem
 	}
 	baseDir = filepath.Clean(baseDir)
 	cfg = normalizeConfig(cfg)
@@ -232,7 +229,7 @@ func (s *Store) putObject(ctx context.Context, tenantID, path string, input io.R
 	}
 	defer s.endOp()
 	if input == nil {
-		return nil, errors.New("input reader is nil")
+		return nil, ErrNilReader
 	}
 	if err := validateTenantID(tenantID, s.cfg); err != nil {
 		return nil, pathError("put", tenantID, err)
@@ -451,7 +448,7 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 		current := s.meta.Chunks[chunkID]
 		segment := s.meta.Segments[chunk.SegmentID]
 		if current == nil || current.State == chunkStateCorrupt || segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateCorrupt {
-			return nil, errors.New("reused chunk is no longer readable")
+			return nil, errChunkNotReadable
 		}
 	}
 	ops := make([]metaOp, 0, len(prepared.segments)+len(prepared.chunks)+4)
@@ -564,7 +561,7 @@ func (s *Store) OpenRange(ctx context.Context, tenantID, path string, offset, le
 		return nil, err
 	}
 	if offset < 0 || length < 0 {
-		return nil, errors.New("range offset and length must be non-negative")
+		return nil, ErrInvalidRange
 	}
 	return s.openReader(tenantID, path, offset, length)
 }
@@ -813,7 +810,7 @@ func (s *Store) commitMetaLocked(ops []metaOp) error {
 
 func (s *Store) checkpointMetaLocked() error {
 	if s.metaLog == nil {
-		return errors.New("metadata log is not open")
+		return errMetadataLogClosed
 	}
 	compactMetadata(s.meta)
 	if err := saveMetaCheckpoint(s.fs, s.metaDir, s.meta); err != nil {

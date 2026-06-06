@@ -11,8 +11,6 @@ import (
 	"strings"
 )
 
-var ErrCorrupt = errors.New("blobfs corruption detected")
-
 type chunkCheckSnapshot struct {
 	TenantID string
 	Path     string
@@ -115,7 +113,7 @@ func (s *Store) checkSnapshots(tenantID, path string) ([]chunkCheckSnapshot, str
 	}
 	manifest := s.meta.Manifests[inode.ManifestID]
 	if manifest == nil {
-		return nil, "", 0, "", nil, errors.New("manifest not found")
+		return nil, "", 0, "", nil, errManifestNotFound
 	}
 	refs := append([]manifestChunk(nil), manifest.Chunks...)
 	sort.Slice(refs, func(i, j int) bool {

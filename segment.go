@@ -27,8 +27,6 @@ const (
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
-var errChunkHashMismatch = errors.New("chunk hash mismatch")
-
 var zstdEncoderPool = sync.Pool{New: func() any {
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
 	if err != nil {

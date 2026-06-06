@@ -14,6 +14,21 @@ var (
 	ErrConflict                 = errors.New("file changed while handle was open")
 	ErrTooLarge                 = errors.New("file too large")
 	ErrTooManyOpenWriteSessions = errors.New("too many open write sessions")
+	ErrBackgroundRunning        = errors.New("background workers are already running")
+	ErrCorrupt                  = errors.New("blobfs corruption detected")
+	ErrNilContext               = errors.New("context is nil")
+	ErrNilFilesystem            = errors.New("filesystem is nil")
+	ErrNilReader                = errors.New("input reader is nil")
+	ErrInvalidRange             = errors.New("range offset and length must be non-negative")
+	ErrReaderClosed             = errors.New("reader is closed")
+	ErrInvalidSeek              = errors.New("invalid seek")
+)
+
+var (
+	errMetadataLogClosed = fs.ErrClosed
+	errManifestNotFound  = fs.ErrNotExist
+	errChunkNotReadable  = errors.New("chunk not readable")
+	errChunkHashMismatch = errors.New("chunk hash mismatch")
 )
 
 func pathError(op, path string, err error) error {
@@ -34,7 +49,7 @@ func invalidPath(op, path string) error {
 
 func contextError(ctx context.Context) error {
 	if ctx == nil {
-		return errors.New("context is nil")
+		return ErrNilContext
 	}
 	return ctx.Err()
 }
