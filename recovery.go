@@ -75,11 +75,15 @@ type ByteStats struct {
 
 // GCStats summarizes recorded GC runs.
 type GCStats struct {
-	Runs                int
-	LastEpoch           int64
-	LastRunState        string
-	LastBackgroundAt    time.Time
+	Runs      int
+	LastEpoch int64
+	// LastRunState is the final state recorded for the newest GC run.
+	LastRunState string
+	// LastBackgroundAt is the wall-clock time of the latest background GC attempt.
+	LastBackgroundAt time.Time
+	// LastBackgroundEpoch is the GC epoch returned by the latest background run.
 	LastBackgroundEpoch int64
+	// LastBackgroundError is the latest background GC error message, if any.
 	LastBackgroundError string
 }
 

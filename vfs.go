@@ -19,14 +19,17 @@ const defaultVFSMode = 0o644
 
 var _ afero.Fs = (*Store)(nil)
 
+// Create opens name for writing, creating or truncating it with the default file mode.
 func (s *Store) Create(name string) (afero.File, error) {
 	return s.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_RDWR, defaultVFSMode)
 }
 
+// Open opens name read-only through the afero.Fs interface.
 func (s *Store) Open(name string) (afero.File, error) {
 	return s.OpenFile(name, os.O_RDONLY, 0)
 }
 
+// OpenFile opens name using afero-compatible flags and permissions.
 func (s *Store) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
 	return s.OpenFileContext(s.ctx, name, flag, perm)
 }
@@ -151,6 +154,8 @@ func (s *Store) OpenFileContext(ctx context.Context, name string, flag int, perm
 	}, nil
 }
 
+// Mkdir creates a single directory. Creating a tenant root is supported by
+// passing the tenant name as name.
 func (s *Store) Mkdir(name string, perm os.FileMode) error {
 	if err := s.beginOp(s.ctx); err != nil {
 		return err
@@ -208,6 +213,7 @@ func (s *Store) Mkdir(name string, perm os.FileMode) error {
 	})
 }
 
+// MkdirAll creates a directory and any missing parent directories.
 func (s *Store) MkdirAll(name string, perm os.FileMode) error {
 	if err := s.beginOp(s.ctx); err != nil {
 		return err
@@ -276,6 +282,7 @@ func (s *Store) MkdirAll(name string, perm os.FileMode) error {
 	return s.commitMetaLocked(ops)
 }
 
+// Remove deletes a single file or empty directory from the namespace.
 func (s *Store) Remove(name string) error {
 	if err := s.beginOp(s.ctx); err != nil {
 		return err
@@ -315,6 +322,9 @@ func (s *Store) Remove(name string) error {
 	return s.commitMetaLocked(ops)
 }
 
+// RemoveAll detaches a path from the namespace. Directory descendants become
+// unreachable immediately and are reclaimed later by GC instead of being walked
+// synchronously.
 func (s *Store) RemoveAll(name string) error {
 	if err := s.beginOp(s.ctx); err != nil {
 		return err
@@ -357,6 +367,7 @@ func (s *Store) RemoveAll(name string) error {
 	return s.commitMetaLocked(ops)
 }
 
+// Rename moves or replaces a file or directory within one tenant namespace.
 func (s *Store) Rename(oldname, newname string) error {
 	if err := s.beginOp(s.ctx); err != nil {
 		return err
@@ -435,6 +446,7 @@ func (s *Store) Rename(oldname, newname string) error {
 	return s.commitMetaLocked(ops)
 }
 
+// Stat returns metadata for a VFS path.
 func (s *Store) Stat(name string) (os.FileInfo, error) {
 	tenantID, path, root, err := s.splitVFSPath(name)
 	if err != nil {
@@ -456,10 +468,12 @@ func (s *Store) Stat(name string) (os.FileInfo, error) {
 	return info, nil
 }
 
+// Name returns the filesystem name used by afero.
 func (s *Store) Name() string {
 	return "blobfs"
 }
 
+// Chmod updates the VFS mode bits for a path.
 func (s *Store) Chmod(name string, mode os.FileMode) error {
 	return s.updateVFSMetadata("chmod", name, func(inode *inodeRecord) {
 		if inode.Kind == fileKindDir {
@@ -470,6 +484,7 @@ func (s *Store) Chmod(name string, mode os.FileMode) error {
 	})
 }
 
+// Chown updates stored UID/GID metadata for a path.
 func (s *Store) Chown(name string, uid, gid int) error {
 	return s.updateVFSMetadata("chown", name, func(inode *inodeRecord) {
 		inode.UID = uid
@@ -477,6 +492,7 @@ func (s *Store) Chown(name string, uid, gid int) error {
 	})
 }
 
+// Chtimes updates stored access and modification times for a path.
 func (s *Store) Chtimes(name string, atime, mtime time.Time) error {
 	return s.updateVFSMetadata("chtimes", name, func(inode *inodeRecord) {
 		inode.ATime = atime.UnixNano()

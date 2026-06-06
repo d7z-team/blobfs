@@ -548,6 +548,8 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 	}, nil
 }
 
+// OpenObject opens an immutable reader for the active object at tenantID/path.
+// The returned reader pins referenced segments until Close is called.
 func (s *Store) OpenObject(ctx context.Context, tenantID, path string) (*ObjectReader, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -555,6 +557,8 @@ func (s *Store) OpenObject(ctx context.Context, tenantID, path string) (*ObjectR
 	return s.openReader(tenantID, path, 0, -1)
 }
 
+// OpenRange opens a reader limited to [offset, offset+length). If length extends
+// past the object size, the reader stops at EOF.
 func (s *Store) OpenRange(ctx context.Context, tenantID, path string, offset, length int64) (io.ReadCloser, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -565,6 +569,7 @@ func (s *Store) OpenRange(ctx context.Context, tenantID, path string, offset, le
 	return s.openReader(tenantID, path, offset, length)
 }
 
+// StatObject returns metadata for an active file object without opening its content.
 func (s *Store) StatObject(ctx context.Context, tenantID, path string) (*ObjectInfo, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -589,6 +594,7 @@ func (s *Store) StatObject(ctx context.Context, tenantID, path string) (*ObjectI
 	return &info, nil
 }
 
+// UpdateMetadata replaces user options on an active file without changing its content.
 func (s *Store) UpdateMetadata(ctx context.Context, tenantID, path string, options map[string]string) (*ObjectInfo, error) {
 	if err := s.beginOp(ctx); err != nil {
 		return nil, err
@@ -624,6 +630,7 @@ func (s *Store) UpdateMetadata(ctx context.Context, tenantID, path string, optio
 	return &info, nil
 }
 
+// DeleteObject removes one active file from the namespace and releases its references.
 func (s *Store) DeleteObject(ctx context.Context, tenantID, path string) error {
 	if err := s.beginOp(ctx); err != nil {
 		return err
@@ -664,6 +671,8 @@ func (s *Store) DeleteObject(ctx context.Context, tenantID, path string) error {
 	return s.commitMetaLocked(ops)
 }
 
+// StartBackground starts periodic compacting GC until ctx is canceled or the
+// store is closed. The latest background GC status is exposed through Health and Stats.
 func (s *Store) StartBackground(ctx context.Context) error {
 	if err := contextError(ctx); err != nil {
 		return err
@@ -715,6 +724,8 @@ func (s *Store) StartBackground(ctx context.Context) error {
 	return nil
 }
 
+// Close stops background work, waits for in-flight operations, checkpoints
+// metadata, closes resources, and removes the process lock.
 func (s *Store) Close() error {
 	var closeErr error
 	s.closeOnce.Do(func() {

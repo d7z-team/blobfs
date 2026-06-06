@@ -105,6 +105,7 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 	}, nil
 }
 
+// Read copies object bytes into p from the current reader offset.
 func (r *ObjectReader) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -146,6 +147,8 @@ func (r *ObjectReader) Read(p []byte) (int, error) {
 	return total, nil
 }
 
+// Seek changes the current reader offset, clamping seeks past the opened range
+// to EOF.
 func (r *ObjectReader) Seek(offset int64, whence int) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -173,6 +176,8 @@ func (r *ObjectReader) Seek(offset int64, whence int) (int64, error) {
 	return r.offset, nil
 }
 
+// Close releases segment pins held by the reader. It is safe to call Close more
+// than once.
 func (r *ObjectReader) Close() error {
 	r.mu.Lock()
 	if r.closed {
