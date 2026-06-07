@@ -215,9 +215,13 @@ func newMetadata() *metadata {
 	}
 }
 
+func metaTxLogDir(metaDir string) string {
+	return filepath.Join(metaDir, "txlog")
+}
+
 func loadMetadata(fs afero.Fs, metaDir string) (*metadata, string, metadataLoadReport, error) {
 	meta := newMetadata()
-	if err := fs.MkdirAll(filepath.Join(metaDir, "txlog"), 0o755); err != nil {
+	if err := fs.MkdirAll(metaTxLogDir(metaDir), 0o755); err != nil {
 		return nil, "", metadataLoadReport{}, err
 	}
 	if err := loadMetaCheckpoint(fs, filepath.Join(metaDir, metaCheckpointFile), meta); err != nil {
@@ -231,7 +235,7 @@ func loadMetadata(fs afero.Fs, metaDir string) (*metadata, string, metadataLoadR
 	if logFile == "" {
 		logFile = metaLogFile
 	}
-	report, err := replayMetaLog(fs, filepath.Join(metaDir, "txlog", logFile), meta)
+	report, err := replayMetaLog(fs, filepath.Join(metaTxLogDir(metaDir), logFile), meta)
 	if err != nil {
 		return nil, "", metadataLoadReport{}, err
 	}

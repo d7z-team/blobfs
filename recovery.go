@@ -288,6 +288,8 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		OK:      len(replayWarnings) == 0,
 		Message: healthMessage(len(replayWarnings) == 0, "metadata log replay was clean", metadataReplayWarningMessage(replayWarnings)),
 	})
+	txlogDirOK := s.pathAccessible(metaTxLogDir(s.metaDir))
+	report.Checks = append(report.Checks, HealthCheck{Name: "txlog_dir_available", OK: txlogDirOK, Message: healthMessage(txlogDirOK, "metadata log directory is accessible", "metadata log directory is not accessible")})
 	segmentsOK := s.pathAccessible(s.segmentsDir)
 	report.Checks = append(report.Checks, HealthCheck{Name: "segments_dir_available", OK: segmentsOK, Message: healthMessage(segmentsOK, "segments directory is accessible", "segments directory is not accessible")})
 	stagingOK := s.pathAccessible(s.stagingDir)
@@ -309,7 +311,7 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		report.Writable = false
 		return report, nil
 	}
-	if !txlogOK || !stagingOK {
+	if !txlogOK || !txlogDirOK || !stagingOK {
 		report.State = HealthReadOnly
 		report.Writable = false
 		return report, nil

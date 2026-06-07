@@ -854,6 +854,46 @@ func TestCheckpointCompactsMetadataLogAndRecovers(t *testing.T) {
 	}
 }
 
+func TestCloseRecreatesMissingTxLogDirDuringCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir, testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.MkdirAll("tenant-a/checkpoints", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "checkpoints/blob", []byte("payload"))
+	if err := os.RemoveAll(filepath.Join(dir, "meta", "txlog")); err != nil {
+		t.Fatalf("remove txlog dir: %v", err)
+	}
+	health, err := store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if health.State != HealthReadOnly || !hasHealthCheck(health, "txlog_dir_available", false) {
+		t.Fatalf("missing txlog dir should make health read-only: %+v", health)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close after missing txlog dir: %v", err)
+	}
+	super, err := loadMetaSuperBlock(afero.NewOsFs(), filepath.Join(dir, "meta"))
+	if err != nil {
+		t.Fatalf("load superblock: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "meta", "txlog", super.LogFile)); err != nil {
+		t.Fatalf("active txlog was not recreated: %v", err)
+	}
+	reopened, err := Open(dir, testConfig())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if got := readTestBytes(t, reopened, "tenant-a", "checkpoints/blob"); string(got) != "payload" {
+		t.Fatalf("recovered content = %q", got)
+	}
+}
+
 func TestRemoveAllDetachesNamespaceAndGCReleasesRefs(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/tree/sub", 0o755); err != nil {

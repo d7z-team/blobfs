@@ -186,7 +186,12 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	logPath := filepath.Join(store.metaDir, "txlog", store.metaLogName)
+	txlogDir := metaTxLogDir(store.metaDir)
+	if err := fs.MkdirAll(txlogDir, 0o755); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	logPath := filepath.Join(txlogDir, store.metaLogName)
 	metaLog, err := fs.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		_ = store.Close()
@@ -871,13 +876,13 @@ func (s *Store) checkpointMetaLocked() error {
 	}
 	if err := newLog.Sync(); err != nil {
 		_ = newLog.Close()
-		_ = s.fs.Remove(filepath.Join(s.metaDir, "txlog", newName))
+		_ = s.fs.Remove(filepath.Join(metaTxLogDir(s.metaDir), newName))
 		s.lastCheckpointErr = err
 		return err
 	}
 	if err := saveSuperBlock(s.fs, s.metaDir, s.meta.TxID, newName); err != nil {
 		_ = newLog.Close()
-		_ = s.fs.Remove(filepath.Join(s.metaDir, "txlog", newName))
+		_ = s.fs.Remove(filepath.Join(metaTxLogDir(s.metaDir), newName))
 		s.lastCheckpointErr = err
 		return err
 	}
@@ -892,7 +897,7 @@ func (s *Store) checkpointMetaLocked() error {
 		cleanupErr = errors.Join(cleanupErr, oldLog.Close())
 	}
 	if oldName != "" && oldName != newName {
-		if err := s.fs.Remove(filepath.Join(s.metaDir, "txlog", oldName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := s.fs.Remove(filepath.Join(metaTxLogDir(s.metaDir), oldName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
@@ -903,9 +908,13 @@ func (s *Store) checkpointMetaLocked() error {
 }
 
 func (s *Store) createMetaLogGenerationLocked(startName string) (afero.File, string, error) {
+	txlogDir := metaTxLogDir(s.metaDir)
+	if err := s.fs.MkdirAll(txlogDir, 0o755); err != nil {
+		return nil, "", err
+	}
 	name := startName
 	for i := 0; i < 1000; i++ {
-		path := filepath.Join(s.metaDir, "txlog", name)
+		path := filepath.Join(txlogDir, name)
 		file, err := s.fs.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_WRONLY, 0o600)
 		if os.IsExist(err) {
 			name = nextMetaLogName(name)
