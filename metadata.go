@@ -361,6 +361,8 @@ func applyMetaOp(meta *metadata, op metaOp) {
 	switch op.Type {
 	case "put_tenant":
 		meta.Tenants[op.TenantID] = op.ChildID
+	case "del_tenant":
+		delete(meta.Tenants, op.TenantID)
 	case "put_inode":
 		if op.Inode != nil {
 			inode := *op.Inode
@@ -440,8 +442,13 @@ func recomputeMetaCounters(meta *metadata) {
 		}
 	}
 	for _, seg := range meta.Segments {
+		if seg == nil {
+			continue
+		}
 		var seq int64
-		_, _ = sscanfSegmentID(seg.SegmentID, &seq)
+		if _, err := sscanfSegmentID(seg.SegmentID, &seq); err != nil {
+			continue
+		}
 		if seq >= meta.NextSegmentSeq {
 			meta.NextSegmentSeq = seq + 1
 		}

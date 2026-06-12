@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,5 +195,28 @@ func TestStagingSegmentDirectoriesArePrivate(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o700 {
 		t.Fatalf("staging segment dir mode = %#o", info.Mode().Perm())
+	}
+}
+
+func TestParseRecordHeaderRawSizeOverflow(t *testing.T) {
+	header := makeRecordHeader("chunk-id", 10, 5, 123)
+	// Overwrite rawSize bytes [72:80] with uint64 > math.MaxInt64
+	binary.LittleEndian.PutUint64(header[72:80], math.MaxUint64)
+	// Leave storedSize and payloadLen at valid equal values
+
+	_, _, _, _, _, _, err := parseRecordHeader(header)
+	if err == nil {
+		t.Fatal("expected error for rawSize overflow, but no error returned")
+	}
+}
+
+func TestParseRecordHeaderSizeOverflow(t *testing.T) {
+	header := makeRecordHeader("chunk-id", 10, 5, 123)
+	binary.LittleEndian.PutUint64(header[80:88], math.MaxUint64)
+	binary.LittleEndian.PutUint64(header[96:104], math.MaxUint64)
+
+	_, _, _, _, _, _, err := parseRecordHeader(header)
+	if err == nil {
+		t.Fatal("expected error for storedSize overflow")
 	}
 }

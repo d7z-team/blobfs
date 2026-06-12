@@ -115,38 +115,36 @@ func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
 		s.metaMu.RUnlock()
 	}
 
-	deleted, err := s.removeSegmentFiles(ctx, removeSegments)
-	if err != nil || len(deleted) == 0 {
-		if err != nil {
-			return result, errors.Join(err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
+	deleted, removeErr := s.removeSegmentFiles(ctx, removeSegments)
+
+	if len(deleted) > 0 {
+		s.metaMu.Lock()
+		ops = ops[:0]
+		_, removable := s.collectSegmentWorkLocked(segmentDeleteCutoff, false)
+		ready := make(map[string]bool, len(removable))
+		for _, seg := range removable {
+			ready[seg.SegmentID] = true
 		}
-		return result, s.recordGCRun(epoch, "DONE", startedAt, safetyCutoff, "")
-	}
-	s.metaMu.Lock()
-	ops = ops[:0]
-	_, removable := s.collectSegmentWorkLocked(segmentDeleteCutoff, false)
-	ready := make(map[string]bool, len(removable))
-	for _, seg := range removable {
-		ready[seg.SegmentID] = true
-	}
-	for _, seg := range deleted {
-		if current := s.meta.Segments[seg.SegmentID]; current != nil && current.State != segmentStateDeleted && ready[seg.SegmentID] {
-			next := *current
-			next.State = segmentStateDeleted
-			next.DeletedAt = now
-			ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
-			result.SegmentsDeleted++
+		for _, seg := range deleted {
+			if current := s.meta.Segments[seg.SegmentID]; current != nil && current.State != segmentStateDeleted && ready[seg.SegmentID] {
+				next := *current
+				next.State = segmentStateDeleted
+				next.DeletedAt = now
+				ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
+				result.SegmentsDeleted++
+			}
 		}
-	}
-	if err := s.commitMetaLocked(ops); err != nil {
+		if err := s.commitMetaLocked(ops); err != nil {
+			s.metaMu.Unlock()
+			return result, errors.Join(removeErr, err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
+		}
 		s.metaMu.Unlock()
-		return result, errors.Join(err, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, err.Error()))
 	}
-	s.metaMu.Unlock()
-	if err := s.recordGCRun(epoch, "DONE", startedAt, safetyCutoff, ""); err != nil {
-		return result, err
+
+	if removeErr != nil {
+		return result, errors.Join(removeErr, s.recordGCRun(epoch, "FAILED", startedAt, safetyCutoff, removeErr.Error()))
 	}
-	return result, nil
+	return result, s.recordGCRun(epoch, "DONE", startedAt, safetyCutoff, "")
 }
 
 func (s *Store) recordGCRun(epoch int64, state string, startedAt, safetyCutoff int64, notes string) error {
@@ -165,7 +163,7 @@ func (s *Store) recordGCRun(epoch int64, state string, startedAt, safetyCutoff i
 
 func (s *Store) markUnreferencedChunksLocked(now, cutoff int64, confirmCycles int, result *GCResult, ops *[]metaOp) {
 	for _, chunk := range s.meta.Chunks {
-		if chunk.State == chunkStateDeleted || chunk.RefCount > 0 || chunk.CreatedAt >= cutoff {
+		if chunk == nil || chunk.State == chunkStateDeleted || chunk.RefCount > 0 || chunk.CreatedAt >= cutoff {
 			if chunk.RefCount > 0 {
 				result.LiveChunks++
 			}

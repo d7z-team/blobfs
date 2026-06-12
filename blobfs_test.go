@@ -982,3 +982,192 @@ func (r *blockingReader) Read(p []byte) (int, error) {
 	}
 	return 0, io.EOF
 }
+
+func TestDeleteTenantBasic(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/dir", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := []byte("delete-tenant-test")
+	putTestBytes(t, store, "tenant-a", "dir/file", data)
+
+	if err := store.DeleteTenant(testContext(t), "tenant-a"); err != nil {
+		t.Fatalf("delete tenant: %v", err)
+	}
+
+	_, err := store.OpenObject(testContext(t), "tenant-a", "dir/file")
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("open after delete: %v, want ErrNotExist", err)
+	}
+}
+
+func TestDeleteTenantIdempotent(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/sub", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "sub/x", []byte("idempotent"))
+	if err := store.DeleteTenant(testContext(t), "tenant-a"); err != nil {
+		t.Fatalf("first delete: %v", err)
+	}
+	if err := store.DeleteTenant(testContext(t), "tenant-a"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("second delete: %v, want ErrNotExist", err)
+	}
+}
+
+func TestDeleteTenantNonexistent(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.DeleteTenant(testContext(t), "nonexistent"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("delete nonexistent: %v, want ErrNotExist", err)
+	}
+}
+
+func TestDeleteTenantGCleanup(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/data", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "data/blob", bytes.Repeat([]byte("X"), 512))
+	putTestBytes(t, store, "tenant-a", "data/other", bytes.Repeat([]byte("Y"), 512))
+
+	store.metaMu.RLock()
+	preInodes := len(store.meta.Inodes)
+	preChunks := len(store.meta.Chunks)
+	preSegments := len(store.meta.Segments)
+	store.metaMu.RUnlock()
+
+	if err := store.DeleteTenant(testContext(t), "tenant-a"); err != nil {
+		t.Fatalf("delete tenant: %v", err)
+	}
+
+	if _, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+
+	store.metaMu.RLock()
+	defer store.metaMu.RUnlock()
+	postChunks := len(store.meta.Chunks)
+	postSegments := len(store.meta.Segments)
+	activeInodes := 0
+	for _, inode := range store.meta.Inodes {
+		if inode.State == fileStateActive {
+			activeInodes++
+		}
+	}
+
+	if activeInodes > 0 {
+		t.Errorf("%d active inodes remain after GC, want 0", activeInodes)
+	}
+	t.Logf("pre: inodes=%d chunks=%d segs=%d | post: chunks=%d segs=%d", preInodes, preChunks, preSegments, postChunks, postSegments)
+}
+
+func TestDeleteTenantRecreatable(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/sub", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "sub/f", []byte("old"))
+	if err := store.DeleteTenant(testContext(t), "tenant-a"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// Recreate the same tenant
+	if err := store.MkdirAll("tenant-a/newtree", 0o755); err != nil {
+		t.Fatalf("mkdirall after delete: %v", err)
+	}
+	newData := []byte("new-tenant-data")
+	putTestBytes(t, store, "tenant-a", "newtree/g", newData)
+
+	got := readTestBytes(t, store, "tenant-a", "newtree/g")
+	if !bytes.Equal(got, newData) {
+		t.Fatalf("read after recreate = %q, want %q", got, newData)
+	}
+}
+
+func TestDeleteTenantVFSError(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/dir", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "dir/f", []byte("vfs-test"))
+	if err := store.DeleteTenant(testContext(t), "tenant-a"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	_, err := store.Open("tenant-a/dir/f")
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("VFS open after delete: %v, want ErrNotExist", err)
+	}
+}
+
+func TestDeleteTenantConcurrentRead(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/dir", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := bytes.Repeat([]byte("concurrent"), 128)
+	putTestBytes(t, store, "tenant-a", "dir/f", data)
+
+	reader, err := store.OpenObject(testContext(t), "tenant-a", "dir/f")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer reader.Close()
+
+	if err := store.DeleteTenant(testContext(t), "tenant-a"); err != nil {
+		t.Fatalf("delete tenant: %v", err)
+	}
+
+	// Existing reader should still work (pinned chunks)
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read after delete: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("data mismatch after concurrent delete")
+	}
+
+	// New open should fail
+	_, err = store.OpenObject(testContext(t), "tenant-a", "dir/f")
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("new open after delete: %v, want ErrNotExist", err)
+	}
+}
+
+func TestDeleteTenantOnlyAffectsTargetTenant(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/dir", 0o755); err != nil {
+		t.Fatalf("mkdirall a: %v", err)
+	}
+	if err := store.MkdirAll("tenant-b/dir", 0o755); err != nil {
+		t.Fatalf("mkdirall b: %v", err)
+	}
+	dataA := []byte("tenant-a-data")
+	dataB := []byte("tenant-b-data")
+	putTestBytes(t, store, "tenant-a", "dir/f", dataA)
+	putTestBytes(t, store, "tenant-b", "dir/f", dataB)
+
+	if err := store.DeleteTenant(testContext(t), "tenant-a"); err != nil {
+		t.Fatalf("delete tenant-a: %v", err)
+	}
+
+	// tenant-a should be gone
+	_, err := store.OpenObject(testContext(t), "tenant-a", "dir/f")
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("tenant-a open after delete: %v, want ErrNotExist", err)
+	}
+
+	// tenant-b should be intact
+	got := readTestBytes(t, store, "tenant-b", "dir/f")
+	if !bytes.Equal(got, dataB) {
+		t.Fatalf("tenant-b data = %q, want %q", got, dataB)
+	}
+
+	health, err := store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if health.State != HealthOK {
+		t.Fatalf("health state = %s, want OK", health.State)
+	}
+}

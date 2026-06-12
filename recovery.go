@@ -256,12 +256,18 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 	hasCompactingSegments := false
 	if metaLoaded {
 		for _, chunk := range s.meta.Chunks {
+			if chunk == nil {
+				continue
+			}
 			if chunk.State == chunkStateCorrupt {
 				hasCorruptChunks = true
 				break
 			}
 		}
 		for _, seg := range s.meta.Segments {
+			if seg == nil {
+				continue
+			}
 			switch seg.State {
 			case segmentStateCorrupt:
 				hasCorruptSegments = true
@@ -352,6 +358,9 @@ func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
 		}
 	}
 	for _, chunk := range s.meta.Chunks {
+		if chunk == nil {
+			continue
+		}
 		switch chunk.State {
 		case chunkStateGarbageCandidate:
 			stats.Chunks.GarbageCandidate++
@@ -367,6 +376,9 @@ func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
 		stats.Bytes.StoredChunkBytes += chunk.StoredSize
 	}
 	for _, seg := range s.meta.Segments {
+		if seg == nil {
+			continue
+		}
 		switch seg.State {
 		case segmentStateCompacting:
 			stats.Segments.Compacting++
@@ -428,6 +440,9 @@ func (s *Store) Diagnose(ctx context.Context, opts DiagnoseOptions) (*DiagnoseRe
 	chunksBySegment := map[string]int{}
 	segments := make([]segmentRecord, 0, len(s.meta.Segments))
 	for _, chunk := range s.meta.Chunks {
+		if chunk == nil {
+			continue
+		}
 		if chunk.State == chunkStateDeleted {
 			continue
 		}
@@ -442,6 +457,9 @@ func (s *Store) Diagnose(ctx context.Context, opts DiagnoseOptions) (*DiagnoseRe
 		}
 	}
 	for _, seg := range s.meta.Segments {
+		if seg == nil {
+			continue
+		}
 		segments = append(segments, *seg)
 		if seg.State == segmentStateDeleted {
 			continue
@@ -593,6 +611,9 @@ func healthMessage(ok bool, okMessage, badMessage string) string {
 func (s *Store) referencedSegmentPathsLocked() map[string]bool {
 	referenced := map[string]bool{}
 	for _, seg := range s.meta.Segments {
+		if seg == nil {
+			continue
+		}
 		if seg.State != segmentStateDeleted {
 			referenced[s.segmentPath(seg)] = true
 		}
@@ -629,6 +650,9 @@ func (s *Store) repairCompactingSegments(ctx context.Context, dryRun bool, addAc
 		if err := contextError(ctx); err != nil {
 			return err
 		}
+		if seg == nil {
+			continue
+		}
 		if seg.State != segmentStateCompacting {
 			continue
 		}
@@ -651,6 +675,9 @@ func (s *Store) repairMissingSegments(ctx context.Context, dryRun bool, addActio
 	s.metaMu.RLock()
 	segments := make([]segmentRecord, 0, len(s.meta.Segments))
 	for _, seg := range s.meta.Segments {
+		if seg == nil {
+			continue
+		}
 		if seg.State != segmentStateDeleted {
 			segments = append(segments, *seg)
 		}
@@ -686,6 +713,9 @@ func (s *Store) repairMissingSegments(ctx context.Context, dryRun bool, addActio
 			ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
 		}
 		for _, chunk := range s.meta.Chunks {
+			if chunk == nil {
+				continue
+			}
 			if chunk.SegmentID != segmentID || chunk.State == chunkStateDeleted {
 				continue
 			}

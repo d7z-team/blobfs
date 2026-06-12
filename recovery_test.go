@@ -361,3 +361,77 @@ func hasIssue(report *DiagnoseReport, kind IssueKind) bool {
 	}
 	return false
 }
+
+func TestHealthSurvivesNilChunk(t *testing.T) {
+	store := openTestStore(t)
+	store.metaMu.Lock()
+	store.meta.Chunks["nil-chunk-test"] = nil
+	store.metaMu.Unlock()
+
+	report, err := store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("Health should not error on nil chunk: %v", err)
+	}
+	if report.State == HealthClosed {
+		t.Fatal("nil chunk should not cause store to appear closed")
+	}
+}
+
+func TestStatsSurvivesNilChunk(t *testing.T) {
+	store := openTestStore(t)
+	store.metaMu.Lock()
+	store.meta.Chunks["nil-chunk-test"] = nil
+	store.metaMu.Unlock()
+
+	stats, err := store.Stats(testContext(t))
+	if err != nil {
+		t.Fatalf("Stats should not error on nil chunk: %v", err)
+	}
+	// Basic sanity: stats struct should be populated
+	if stats.Tenants < 0 {
+		t.Fatal("stats should not have negative tenants")
+	}
+}
+
+func TestHealthSurvivesNilSegment(t *testing.T) {
+	store := openTestStore(t)
+	store.metaMu.Lock()
+	store.meta.Segments["nil-seg-test"] = nil
+	store.metaMu.Unlock()
+
+	report, err := store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("Health should not error on nil segment: %v", err)
+	}
+	if report.State == HealthClosed {
+		t.Fatal("nil segment should not cause store to appear closed")
+	}
+}
+
+func TestStatsSurvivesNilSegment(t *testing.T) {
+	store := openTestStore(t)
+	store.metaMu.Lock()
+	store.meta.Segments["nil-seg-test"] = nil
+	store.metaMu.Unlock()
+
+	stats, err := store.Stats(testContext(t))
+	if err != nil {
+		t.Fatalf("Stats should not error on nil segment: %v", err)
+	}
+	if stats.Tenants < 0 {
+		t.Fatal("stats should not have negative tenants")
+	}
+}
+
+func TestDiagnoseSurvivesNilChunk(t *testing.T) {
+	store := openTestStore(t)
+	store.metaMu.Lock()
+	store.meta.Chunks["nil-chunk-test"] = nil
+	store.metaMu.Unlock()
+
+	report, err := store.Diagnose(testContext(t), DiagnoseOptions{})
+	if err != nil {
+		t.Fatalf("Diagnose should not error on nil chunk: %v", err)
+	}
+	_ = report
+}

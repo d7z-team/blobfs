@@ -30,6 +30,7 @@ type faultFS struct {
 	renameSkips    int
 	renameFailures int
 	removeContains string
+	removeSkips    int
 	removeFailures int
 	closeFaults    map[string]int
 }
@@ -61,8 +62,13 @@ func (f *faultFS) failRenamesContainingAfter(fragment string, skip, count int) {
 }
 
 func (f *faultFS) failRemovesContaining(fragment string, count int) {
+	f.failRemovesContainingAfter(fragment, 0, count)
+}
+
+func (f *faultFS) failRemovesContainingAfter(fragment string, skip, count int) {
 	f.mu.Lock()
 	f.removeContains = filepath.ToSlash(fragment)
+	f.removeSkips = skip
 	f.removeFailures = count
 	f.mu.Unlock()
 }
@@ -113,9 +119,15 @@ func (f *faultFS) Rename(oldname, newname string) error {
 
 func (f *faultFS) Remove(name string) error {
 	f.mu.Lock()
-	fail := f.removeFailures > 0 && strings.Contains(filepath.ToSlash(name), f.removeContains)
-	if fail {
-		f.removeFailures--
+	matches := strings.Contains(filepath.ToSlash(name), f.removeContains)
+	fail := false
+	if matches {
+		if f.removeSkips > 0 {
+			f.removeSkips--
+		} else if f.removeFailures > 0 {
+			f.removeFailures--
+			fail = true
+		}
 	}
 	f.mu.Unlock()
 	if fail {
@@ -455,4 +467,81 @@ func TestSegmentFinishReturnsDirectorySyncFailure(t *testing.T) {
 	if files := countRegularFiles(t, fsys, "/blobfs/data/segments"); files != 0 {
 		t.Fatalf("directory sync failure left published segment files, count=%d", files)
 	}
+}
+
+func TestRemoveSegmentFilesPartialFailureUpdatesMetadata(t *testing.T) {
+	fsys := &faultFS{Fs: afero.NewMemMapFs()}
+	store, err := OpenFS(fsys, "/blobfs", testConfig())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.MkdirAll("tenant-a/gc", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "gc/blob1", bytes.Repeat([]byte("A"), 5*1024))
+	putTestBytes(t, store, "tenant-a", "gc/blob2", bytes.Repeat([]byte("B"), 5*1024))
+
+	store.metaMu.RLock()
+	originalSegmentIDs := make(map[string]bool)
+	segmentCount := len(store.meta.Segments)
+	for id := range store.meta.Segments {
+		originalSegmentIDs[id] = true
+	}
+	store.metaMu.RUnlock()
+	if segmentCount < 2 {
+		t.Fatalf("need at least 2 segments, got %d", segmentCount)
+	}
+
+	if err := store.DeleteObject(testContext(t), "tenant-a", "gc/blob1"); err != nil {
+		t.Fatalf("delete blob1: %v", err)
+	}
+	if err := store.DeleteObject(testContext(t), "tenant-a", "gc/blob2"); err != nil {
+		t.Fatalf("delete blob2: %v", err)
+	}
+
+	fsys.failRemovesContainingAfter(filepath.Join("data", "segments"), 1, 1)
+
+	result, err := store.RunGC(testContext(t), GCOptions{Compact: true})
+	if !errors.Is(err, errInjectedFSFault) {
+		t.Fatalf("gc error = %v, want injected fault", err)
+	}
+
+	store.metaMu.RLock()
+	defer store.metaMu.RUnlock()
+
+	deletedFromDisk := 0
+	notDeletedFromDisk := 0
+	deletedInMeta := 0
+	for id := range originalSegmentIDs {
+		seg := store.meta.Segments[id]
+		exists := fileExists(fsys, store.segmentPath(seg))
+		if !exists {
+			deletedFromDisk++
+		} else {
+			notDeletedFromDisk++
+		}
+		if seg.State == segmentStateDeleted {
+			deletedInMeta++
+		}
+	}
+
+	if deletedFromDisk != 1 || notDeletedFromDisk != 1 {
+		t.Errorf("segment removal: deleted=%d not_deleted=%d, want exactly 1 deleted and 1 not deleted", deletedFromDisk, notDeletedFromDisk)
+	}
+	if deletedInMeta != 1 {
+		t.Errorf("metadata DELETED count=%d, want 1 (successfully deleted segment should be marked DELETED)", deletedInMeta)
+	}
+
+	lastRun := store.meta.GC.Recent[len(store.meta.GC.Recent)-1]
+	if lastRun.State != "FAILED" {
+		t.Errorf("gc run state = %s, want FAILED", lastRun.State)
+	}
+	_ = result
+}
+
+func fileExists(fsys afero.Fs, path string) bool {
+	_, err := fsys.Stat(path)
+	return err == nil
 }

@@ -113,3 +113,38 @@ func TestGCHistoryKeepsTotalAndBoundsRecentRuns(t *testing.T) {
 		t.Fatalf("first retained epoch = %d", meta.GC.Recent[0].Epoch)
 	}
 }
+
+func TestSscanfSegmentIDReturnsErrorOnNonNumericID(t *testing.T) {
+	var seq int64
+	n, err := sscanfSegmentID("not-a-number", &seq)
+	if err == nil {
+		t.Fatal("expected error for non-numeric segment ID")
+	}
+	if n != 0 {
+		t.Fatalf("sscanf returned n=%d, want 0", n)
+	}
+	if seq != 0 {
+		t.Fatalf("seq=%d, want 0 on parse failure", seq)
+	}
+}
+
+func TestRecomputeMetaCountersSkipsUnparseableSegmentID(t *testing.T) {
+	meta := newMetadata()
+	meta.Segments["0000000000000100"] = &segmentRecord{SegmentID: "0000000000000100", State: segmentStateSealed}
+	recomputeMetaCounters(meta)
+	if meta.NextSegmentSeq != 101 {
+		t.Fatalf("NextSegmentSeq=%d after valid segment, want 101", meta.NextSegmentSeq)
+	}
+
+	meta.Segments["corrupted"] = &segmentRecord{SegmentID: "corrupted", State: segmentStateSealed}
+	recomputeMetaCounters(meta)
+	if meta.NextSegmentSeq != 101 {
+		t.Fatalf("NextSegmentSeq=%d after corrupted segment, want 101 (should be skipped)", meta.NextSegmentSeq)
+	}
+
+	var seq int64
+	_, err := sscanfSegmentID("corrupted", &seq)
+	if err == nil {
+		t.Fatal("sscanfSegmentID should return error for 'corrupted'")
+	}
+}

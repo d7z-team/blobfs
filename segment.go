@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -254,12 +255,18 @@ func parseRecordHeader(header []byte) (
 	}
 	chunkIDBytes := bytes.TrimRight(header[8:72], "\x00")
 	chunkID = string(chunkIDBytes)
-	rawSize = int64(binary.LittleEndian.Uint64(header[72:80]))
-	storedSize = int64(binary.LittleEndian.Uint64(header[80:88]))
+	rawSizeU64 := binary.LittleEndian.Uint64(header[72:80])
+	storedSizeU64 := binary.LittleEndian.Uint64(header[80:88])
 	compression = binary.LittleEndian.Uint32(header[88:92])
 	checksum = binary.LittleEndian.Uint32(header[92:96])
-	payloadLen = int64(binary.LittleEndian.Uint64(header[96:104]))
-	if payloadLen != storedSize || payloadLen < 0 {
+	payloadLenU64 := binary.LittleEndian.Uint64(header[96:104])
+	if rawSizeU64 > math.MaxInt64 || storedSizeU64 > math.MaxInt64 || payloadLenU64 > math.MaxInt64 {
+		return "", 0, 0, 0, 0, 0, errors.New("segment record size overflow")
+	}
+	rawSize = int64(rawSizeU64)
+	storedSize = int64(storedSizeU64)
+	payloadLen = int64(payloadLenU64)
+	if payloadLen != storedSize {
 		return "", 0, 0, 0, 0, 0, errors.New("invalid segment payload length")
 	}
 	return chunkID, rawSize, storedSize, compression, checksum, payloadLen, nil

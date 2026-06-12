@@ -719,6 +719,38 @@ func (s *Store) DeleteObject(ctx context.Context, tenantID, path string) error {
 	return s.commitMetaLocked(ops)
 }
 
+// DeleteTenant immediately detaches the tenant namespace. Child inodes, manifests,
+// chunks, and segment files are reclaimed asynchronously by GC.
+func (s *Store) DeleteTenant(ctx context.Context, tenantID string) error {
+	if err := s.beginOp(ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
+	if err := validateTenantID(tenantID, s.cfg); err != nil {
+		return err
+	}
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	rootID := s.meta.Tenants[tenantID]
+	if rootID == 0 {
+		return fs.ErrNotExist
+	}
+	root := s.activeInodeLocked(rootID)
+	if root == nil {
+		return fs.ErrNotExist
+	}
+	now := nowUnix()
+	next := cloneInode(root)
+	next.State = fileStateDeleted
+	next.DeletedAt = now
+	next.UpdatedAt = now
+	next.Generation++
+	return s.commitMetaLocked([]metaOp{
+		{Type: "del_tenant", TenantID: tenantID},
+		{Type: "put_inode", Inode: next},
+	})
+}
+
 // StartBackground starts periodic compacting GC until ctx is canceled or the
 // store is closed. The latest background GC status is exposed through Health and Stats.
 func (s *Store) StartBackground(ctx context.Context) error {
@@ -1180,6 +1212,9 @@ func (s *Store) cleanupStagingAndOrphans() error {
 	}
 	referenced := map[string]bool{}
 	for _, seg := range s.meta.Segments {
+		if seg == nil {
+			continue
+		}
 		if seg.State != segmentStateDeleted {
 			referenced[s.segmentPath(seg)] = true
 		}
