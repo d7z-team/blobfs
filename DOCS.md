@@ -260,7 +260,7 @@ MarkMissingCorrupt
 
 txlog 截断、manifest 重建、缺失 chunk 内容重建属于调用方显式恢复流程。异常退出留下的 `LOCK` 会保护 store 独占打开语义；确认 store 所有权后，调用 `RemoveStaleLock` 或 `RemoveFSStaleLock` 显式清理。
 
-`StartBackground` 同一时间只允许一组后台 worker。`Close` 会先取消 store context，等待后台 GC 和已进入的操作结束，然后 checkpoint 并关闭 txlog。
+后台 GC 在 Open 时自动启动（当 BackgroundGCInterval > 0 时），并与 store 生命周期绑定。`Close` 会先取消 store context，等待后台 GC 和已进入的操作结束，然后 checkpoint 并关闭 txlog。
 
 ## 配置
 
@@ -292,6 +292,7 @@ type GCConfig struct {
     CandidateConfirmCycles int
     SegmentDeleteDelay     time.Duration
     CompactGarbageRatio    float64
+    BackgroundGCInterval   time.Duration
 }
 ```
 
@@ -312,6 +313,7 @@ GC.SafetyWindow: 24h
 GC.CandidateConfirmCycles: 2
 GC.SegmentDeleteDelay: 24h
 GC.CompactGarbageRatio: 0.6
+GC.BackgroundGCInterval: 0 (disabled by default)
 ```
 
 ## 路径规则

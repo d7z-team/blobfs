@@ -478,18 +478,6 @@ func TestScrubCheckFilesKeepsOpenedSnapshotAfterDelete(t *testing.T) {
 	}
 }
 
-func TestStartBackgroundRejectsReentry(t *testing.T) {
-	store := openTestStore(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := store.StartBackground(ctx); err != nil {
-		t.Fatalf("start background: %v", err)
-	}
-	if err := store.StartBackground(ctx); !errors.Is(err, ErrBackgroundRunning) {
-		t.Fatalf("second start background = %v, want %v", err, ErrBackgroundRunning)
-	}
-}
-
 func openWriteSessionCount(store *Store) int {
 	store.writeSessionMu.Lock()
 	defer store.writeSessionMu.Unlock()

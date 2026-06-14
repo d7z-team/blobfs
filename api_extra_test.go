@@ -45,7 +45,6 @@ func TestPublicAPINilContextAndErrorCases(t *testing.T) {
 	assertNilContext("Scrub", err)
 	_, err = store.RunGC(nilCtx, GCOptions{})
 	assertNilContext("RunGC", err)
-	assertNilContext("StartBackground", store.StartBackground(nilCtx))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

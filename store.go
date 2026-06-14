@@ -47,6 +47,7 @@ type Store struct {
 	lastBackgroundGCAt  time.Time
 	lastBackgroundGC    *GCResult
 	lastBackgroundGCErr error
+	bgTicker            *time.Ticker
 
 	handleMu sync.Mutex
 	handles  map[storeHandle]struct{}
@@ -202,7 +203,47 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	if store.cfg.GC.BackgroundGCInterval > 0 {
+		store.startBackgroundGC()
+	}
 	return store, nil
+}
+
+func (s *Store) startBackgroundGC() {
+	s.bgTicker = time.NewTicker(s.cfg.GC.BackgroundGCInterval)
+	s.bgWG.Add(1)
+	s.bgRuns = true
+
+	go func() {
+		defer func() {
+			s.bgTicker.Stop()
+			s.lifeMu.Lock()
+			s.bgRuns = false
+			s.bgTicker = nil
+			s.lifeMu.Unlock()
+			s.bgWG.Done()
+		}()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-s.closed:
+				return
+			case <-s.bgTicker.C:
+				result, err := s.RunGC(s.ctx, GCOptions{Compact: true})
+				s.backgroundMu.Lock()
+				s.lastBackgroundGCAt = time.Now()
+				if result != nil {
+					copyResult := *result
+					s.lastBackgroundGC = &copyResult
+				} else {
+					s.lastBackgroundGC = nil
+				}
+				s.lastBackgroundGCErr = err
+				s.backgroundMu.Unlock()
+			}
+		}
+	}()
 }
 
 func (s *Store) beginOp(ctx context.Context) error {
@@ -749,59 +790,6 @@ func (s *Store) DeleteTenant(ctx context.Context, tenantID string) error {
 		{Type: "del_tenant", TenantID: tenantID},
 		{Type: "put_inode", Inode: next},
 	})
-}
-
-// StartBackground starts periodic compacting GC until ctx is canceled or the
-// store is closed. The latest background GC status is exposed through Health and Stats.
-func (s *Store) StartBackground(ctx context.Context) error {
-	if err := contextError(ctx); err != nil {
-		return err
-	}
-	s.lifeMu.Lock()
-	if s.closing {
-		s.lifeMu.Unlock()
-		return os.ErrClosed
-	}
-	if s.bgRuns {
-		s.lifeMu.Unlock()
-		return ErrBackgroundRunning
-	}
-	s.bgRuns = true
-	s.bgWG.Add(1)
-	s.lifeMu.Unlock()
-	ticker := time.NewTicker(time.Minute)
-	go func() {
-		defer func() {
-			ticker.Stop()
-			s.lifeMu.Lock()
-			s.bgRuns = false
-			s.lifeMu.Unlock()
-			s.bgWG.Done()
-		}()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-s.ctx.Done():
-				return
-			case <-s.closed:
-				return
-			case <-ticker.C:
-				result, err := s.RunGC(s.ctx, GCOptions{Compact: true})
-				s.backgroundMu.Lock()
-				s.lastBackgroundGCAt = time.Now()
-				if result != nil {
-					copyResult := *result
-					s.lastBackgroundGC = &copyResult
-				} else {
-					s.lastBackgroundGC = nil
-				}
-				s.lastBackgroundGCErr = err
-				s.backgroundMu.Unlock()
-			}
-		}
-	}()
-	return nil
 }
 
 // Close stops background work, waits for in-flight operations, checkpoints

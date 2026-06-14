@@ -60,6 +60,7 @@ type GCConfig struct {
 	CandidateConfirmCycles int
 	SegmentDeleteDelay     time.Duration
 	CompactGarbageRatio    float64
+	BackgroundGCInterval   time.Duration
 }
 
 // GCOptions overrides selected GC settings for a single run.
@@ -249,6 +250,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.GC.CompactGarbageRatio <= 0 || cfg.GC.CompactGarbageRatio > 1 {
 		return errors.New("compact garbage ratio must be within (0, 1]")
+	}
+	if cfg.GC.BackgroundGCInterval < 0 {
+		return errors.New("background gc interval must be non-negative")
 	}
 	return nil
 }

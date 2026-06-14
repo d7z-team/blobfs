@@ -14,7 +14,6 @@ var (
 	ErrConflict                 = errors.New("file changed while handle was open")
 	ErrTooLarge                 = errors.New("file too large")
 	ErrTooManyOpenWriteSessions = errors.New("too many open write sessions")
-	ErrBackgroundRunning        = errors.New("background workers are already running")
 	ErrCorrupt                  = errors.New("blobfs corruption detected")
 	ErrNilContext               = errors.New("context is nil")
 	ErrNilFilesystem            = errors.New("filesystem is nil")

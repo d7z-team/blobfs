@@ -10,9 +10,10 @@
 // afero.Fs for callers that prefer filesystem operations over tenant/path
 // object calls.
 //
-// Garbage collection is explicit unless StartBackground is used. Namespace
-// operations make paths visible or unreachable immediately, while unreachable
-// metadata and physical segment files are reclaimed by RunGC.
+// Garbage collection runs automatically in the background when
+// BackgroundGCInterval is configured, or can be triggered manually via RunGC.
+// Namespace operations make paths visible or unreachable immediately, while
+// unreachable metadata and physical segment files are reclaimed by GC.
 //
 // A minimal object workflow:
 //

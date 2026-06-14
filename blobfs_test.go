@@ -30,6 +30,7 @@ func testConfig() Config {
 	cfg.GC.SegmentDeleteDelay = -1
 	cfg.GC.CandidateConfirmCycles = 1
 	cfg.GC.CompactGarbageRatio = 0.25
+	cfg.GC.BackgroundGCInterval = time.Hour
 	return cfg
 }
 
@@ -772,16 +773,6 @@ func TestPublicAPIVFSSmokeAndBoundaries(t *testing.T) {
 	if err != nil || len(dirEntries) != 3 {
 		t.Fatalf("read dir entries = %v, %v", dirEntries, err)
 	}
-	var nilContext context.Context
-	if err := store.StartBackground(nilContext); err == nil {
-		t.Fatal("nil background context should fail")
-	}
-	bgCtx, cancel := context.WithCancel(context.Background())
-	if err := store.StartBackground(bgCtx); err != nil {
-		cancel()
-		t.Fatalf("start background: %v", err)
-	}
-	cancel()
 	if _, err := store.Put(testContext(t), "bad/tenant", "x", bytes.NewReader(nil), nil); err == nil {
 		t.Fatal("invalid tenant should fail")
 	}
