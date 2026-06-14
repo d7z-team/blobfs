@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/spf13/afero"
@@ -22,19 +23,19 @@ const (
 	HealthDegraded HealthState = "DEGRADED"
 	// HealthReadOnly means metadata is loaded but basic writable paths are unavailable.
 	HealthReadOnly HealthState = "READ_ONLY"
-	// HealthCorrupt means known corrupt or missing data exists.
-	HealthCorrupt HealthState = "CORRUPT"
 	// HealthClosed means the store has been closed.
 	HealthClosed HealthState = "CLOSED"
 )
 
 // HealthReport is a lightweight availability report.
 type HealthReport struct {
-	State       HealthState
-	Readable    bool
-	Writable    bool
-	Checks      []HealthCheck
-	GeneratedAt time.Time
+	State           HealthState
+	Readable        bool
+	Writable        bool
+	DegradedObjects int
+	AffectedTenants []string
+	Checks          []HealthCheck
+	GeneratedAt     time.Time
 }
 
 // HealthCheck is one lightweight health assertion.
@@ -54,16 +55,16 @@ type ManifestStats struct {
 type ChunkStats struct {
 	Active           int
 	GarbageCandidate int
+	Missing          int
 	Deleted          int
-	Corrupt          int
 }
 
 // SegmentStats groups segment counts by state.
 type SegmentStats struct {
 	Sealed     int
 	Compacting int
+	Missing    int
 	Deleted    int
-	Corrupt    int
 }
 
 // ByteStats summarizes logical and physical byte counters from metadata.
@@ -89,17 +90,18 @@ type GCStats struct {
 
 // StatsSnapshot is a point-in-time metadata-only statistics snapshot.
 type StatsSnapshot struct {
-	TxID        uint64
-	Tenants     int
-	Inodes      int
-	Objects     int
-	Directories int
-	Manifests   ManifestStats
-	Chunks      ChunkStats
-	Segments    SegmentStats
-	Bytes       ByteStats
-	GC          GCStats
-	GeneratedAt time.Time
+	TxID            uint64
+	Tenants         int
+	Inodes          int
+	Objects         int
+	DegradedObjects int
+	Directories     int
+	Manifests       ManifestStats
+	Chunks          ChunkStats
+	Segments        SegmentStats
+	Bytes           ByteStats
+	GC              GCStats
+	GeneratedAt     time.Time
 }
 
 // DiagnoseOptions controls optional filesystem checks.
@@ -129,10 +131,10 @@ const (
 	IssueMissingSegment IssueKind = "missing_segment"
 	// IssueCompactingSegment is a lingering COMPACTING segment.
 	IssueCompactingSegment IssueKind = "compacting_segment"
-	// IssueCorruptChunk is a chunk already marked corrupt.
-	IssueCorruptChunk IssueKind = "corrupt_chunk"
-	// IssueCorruptSegment is a segment already marked corrupt.
-	IssueCorruptSegment IssueKind = "corrupt_segment"
+	// IssueMissingChunk is a chunk marked missing.
+	IssueMissingChunk IssueKind = "missing_chunk"
+	// IssueDegradedObject is an object degraded by missing data.
+	IssueDegradedObject IssueKind = "degraded_object"
 	// IssueChunkWithoutSegment is a live chunk without usable segment metadata.
 	IssueChunkWithoutSegment IssueKind = "chunk_without_segment"
 	// IssueSegmentWithoutChunks is a live segment with no chunk references.
@@ -168,12 +170,12 @@ type Issue struct {
 type RepairOptions struct {
 	DryRun bool
 	// Apply must be true to execute actions. Without Apply, Repair only returns a dry-run plan.
-	Apply              bool
-	CleanStaging       bool
-	CleanOrphans       bool
-	ResetCompacting    bool
-	MarkMissingCorrupt bool
-	MaxActions         int
+	Apply           bool
+	CleanStaging    bool
+	CleanOrphans    bool
+	ResetCompacting bool
+	DegradeMissing  bool
+	MaxActions      int
 }
 
 // RepairReport lists planned or applied repair actions.
@@ -193,8 +195,8 @@ const (
 	RepairCleanOrphanSegment RepairActionType = "clean_orphan_segment"
 	// RepairResetCompacting resets a leftover COMPACTING segment to SEALED.
 	RepairResetCompacting RepairActionType = "reset_compacting"
-	// RepairMarkCorrupt marks metadata that references a missing segment as corrupt.
-	RepairMarkCorrupt RepairActionType = "mark_corrupt"
+	// RepairDegradeMissing marks missing data and degrades affected objects.
+	RepairDegradeMissing RepairActionType = "degrade_missing"
 )
 
 // RepairAction is one planned or applied repair operation.
@@ -251,16 +253,24 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		checkpointMessage = s.lastCheckpointErr.Error()
 	}
 	replayWarnings := append([]metadataReplayWarning(nil), s.recoveryWarnings...)
-	hasCorruptChunks := false
-	hasCorruptSegments := false
+	degradedTenants := map[string]bool{}
+	degradedObjects := 0
+	hasMissingChunks := false
+	hasMissingSegments := false
 	hasCompactingSegments := false
 	if metaLoaded {
+		for _, inode := range s.meta.Inodes {
+			if inode != nil && inode.State == fileStateDegraded {
+				degradedObjects++
+				degradedTenants[inode.TenantID] = true
+			}
+		}
 		for _, chunk := range s.meta.Chunks {
 			if chunk == nil {
 				continue
 			}
-			if chunk.State == chunkStateCorrupt {
-				hasCorruptChunks = true
+			if chunk.State == chunkStateMissing {
+				hasMissingChunks = true
 				break
 			}
 		}
@@ -269,8 +279,8 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 				continue
 			}
 			switch seg.State {
-			case segmentStateCorrupt:
-				hasCorruptSegments = true
+			case segmentStateMissing:
+				hasMissingSegments = true
 			case segmentStateCompacting:
 				hasCompactingSegments = true
 			}
@@ -301,16 +311,15 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 	stagingOK := s.pathAccessible(s.stagingDir)
 	report.Checks = append(report.Checks, HealthCheck{Name: "staging_dir_available", OK: stagingOK, Message: healthMessage(stagingOK, "staging directory is accessible", "staging directory is not accessible")})
 	report.Checks = append(report.Checks,
-		HealthCheck{Name: "no_corrupt_chunks", OK: !hasCorruptChunks, Message: healthMessage(!hasCorruptChunks, "no corrupt chunks", "corrupt chunks exist")},
-		HealthCheck{Name: "no_corrupt_segments", OK: !hasCorruptSegments, Message: healthMessage(!hasCorruptSegments, "no corrupt segments", "corrupt segments exist")},
+		HealthCheck{Name: "no_missing_chunks", OK: !hasMissingChunks, Message: healthMessage(!hasMissingChunks, "no missing chunks", "missing chunks exist")},
+		HealthCheck{Name: "no_missing_segments", OK: !hasMissingSegments, Message: healthMessage(!hasMissingSegments, "no missing segments", "missing segments exist")},
 		HealthCheck{Name: "no_compacting_segments", OK: !hasCompactingSegments, Message: healthMessage(!hasCompactingSegments, "no compacting segments", "compacting segments exist")},
 	)
-	if hasCorruptChunks || hasCorruptSegments {
-		report.State = HealthCorrupt
-		report.Readable = false
-		report.Writable = false
-		return report, nil
+	report.DegradedObjects = degradedObjects
+	for tenantID := range degradedTenants {
+		report.AffectedTenants = append(report.AffectedTenants, tenantID)
 	}
+	sort.Strings(report.AffectedTenants)
 	if !metaLoaded || !segmentsOK {
 		report.State = HealthReadOnly
 		report.Readable = false
@@ -322,7 +331,7 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		report.Writable = false
 		return report, nil
 	}
-	if !checkpointOK || !backgroundOK || hasCompactingSegments || len(replayWarnings) > 0 {
+	if degradedObjects > 0 || hasMissingChunks || hasMissingSegments || !checkpointOK || !backgroundOK || hasCompactingSegments || len(replayWarnings) > 0 {
 		report.State = HealthDegraded
 	}
 	return report, nil
@@ -338,13 +347,17 @@ func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
 	defer s.metaMu.RUnlock()
 	stats := &StatsSnapshot{TxID: s.meta.TxID, Tenants: len(s.meta.Tenants), GeneratedAt: time.Now()}
 	for _, inode := range s.meta.Inodes {
-		if inode.State != fileStateActive {
+		if !inodeVisibleState(inode.State) {
 			continue
 		}
 		stats.Inodes++
 		switch inode.Kind {
 		case fileKindFile:
-			stats.Objects++
+			if inode.State == fileStateDegraded {
+				stats.DegradedObjects++
+			} else {
+				stats.Objects++
+			}
 			stats.Bytes.LogicalObjectBytes += inode.Size
 		case fileKindDir:
 			stats.Directories++
@@ -364,11 +377,11 @@ func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
 		switch chunk.State {
 		case chunkStateGarbageCandidate:
 			stats.Chunks.GarbageCandidate++
+		case chunkStateMissing:
+			stats.Chunks.Missing++
 		case chunkStateDeleted:
 			stats.Chunks.Deleted++
 			continue
-		case chunkStateCorrupt:
-			stats.Chunks.Corrupt++
 		default:
 			stats.Chunks.Active++
 		}
@@ -382,10 +395,10 @@ func (s *Store) Stats(ctx context.Context) (*StatsSnapshot, error) {
 		switch seg.State {
 		case segmentStateCompacting:
 			stats.Segments.Compacting++
+		case segmentStateMissing:
+			stats.Segments.Missing++
 		case segmentStateDeleted:
 			stats.Segments.Deleted++
-		case segmentStateCorrupt:
-			stats.Segments.Corrupt++
 		default:
 			stats.Segments.Sealed++
 		}
@@ -452,9 +465,25 @@ func (s *Store) Diagnose(ctx context.Context, opts DiagnoseOptions) (*DiagnoseRe
 			continue
 		}
 		chunksBySegment[chunk.SegmentID]++
-		if chunk.State == chunkStateCorrupt {
-			addIssue(Issue{Kind: IssueCorruptChunk, Severity: SeverityError, ChunkID: chunk.ChunkID, SegmentID: chunk.SegmentID, Message: "chunk is marked corrupt", Repairable: false})
+		if chunk.State == chunkStateMissing {
+			addIssue(Issue{Kind: IssueMissingChunk, Severity: SeverityError, ChunkID: chunk.ChunkID, SegmentID: chunk.SegmentID, Message: "chunk is marked missing", Repairable: true})
 		}
+	}
+	degradedReported := map[string]bool{}
+	for inodeID, inode := range s.meta.Inodes {
+		if inode == nil || inode.Kind != fileKindFile || inode.State != fileStateDegraded {
+			continue
+		}
+		path, err := s.pathForInodeLocked(inodeID)
+		if err != nil {
+			continue
+		}
+		key := inode.TenantID + "/" + path
+		if degradedReported[key] {
+			continue
+		}
+		degradedReported[key] = true
+		addIssue(Issue{Kind: IssueDegradedObject, Severity: SeverityError, Path: key, Message: inode.DegradedReason, Repairable: true})
 	}
 	for _, seg := range s.meta.Segments {
 		if seg == nil {
@@ -467,8 +496,8 @@ func (s *Store) Diagnose(ctx context.Context, opts DiagnoseOptions) (*DiagnoseRe
 		switch seg.State {
 		case segmentStateCompacting:
 			addIssue(Issue{Kind: IssueCompactingSegment, Severity: SeverityWarn, SegmentID: seg.SegmentID, Message: "segment is left in compacting state", Repairable: true})
-		case segmentStateCorrupt:
-			addIssue(Issue{Kind: IssueCorruptSegment, Severity: SeverityError, SegmentID: seg.SegmentID, Message: "segment is marked corrupt", Repairable: false})
+		case segmentStateMissing:
+			addIssue(Issue{Kind: IssueMissingSegment, Severity: SeverityError, SegmentID: seg.SegmentID, Message: "segment is marked missing", Repairable: true})
 		}
 		if chunksBySegment[seg.SegmentID] == 0 {
 			addIssue(Issue{Kind: IssueSegmentWithoutChunks, Severity: SeverityWarn, SegmentID: seg.SegmentID, Message: "segment has no live chunk references", Repairable: false})
@@ -579,7 +608,7 @@ func (s *Store) Repair(ctx context.Context, opts RepairOptions) (*RepairReport, 
 			return report, err
 		}
 	}
-	if opts.MarkMissingCorrupt {
+	if opts.DegradeMissing {
 		if err := s.repairMissingSegments(ctx, dryRun, addAction); err != nil {
 			return report, err
 		}
@@ -689,7 +718,7 @@ func (s *Store) repairMissingSegments(ctx context.Context, dryRun bool, addActio
 			return err
 		}
 		if err := s.statSegment(seg); errors.Is(err, fs.ErrNotExist) {
-			if !addAction(RepairAction{Type: RepairMarkCorrupt, Target: seg.SegmentID, Message: "mark missing segment references corrupt"}) {
+			if !addAction(RepairAction{Type: RepairDegradeMissing, Target: seg.SegmentID, Message: "degrade objects referenced by missing segment"}) {
 				break
 			}
 			missing[seg.SegmentID] = true
@@ -702,29 +731,11 @@ func (s *Store) repairMissingSegments(ctx context.Context, dryRun bool, addActio
 	}
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
-	now := nowUnix()
 	ops := []metaOp{}
+	issues := make([]CheckIssue, 0, len(missing))
 	for segmentID := range missing {
-		if seg := s.meta.Segments[segmentID]; seg != nil && seg.State != segmentStateDeleted {
-			next := *seg
-			next.State = segmentStateCorrupt
-			next.CorruptAt = now
-			next.CorruptReason = "segment file is missing"
-			ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
-		}
-		for _, chunk := range s.meta.Chunks {
-			if chunk == nil {
-				continue
-			}
-			if chunk.SegmentID != segmentID || chunk.State == chunkStateDeleted {
-				continue
-			}
-			next := *chunk
-			next.State = chunkStateCorrupt
-			next.CorruptAt = now
-			next.CorruptReason = "segment file is missing"
-			ops = append(ops, metaOp{Type: "put_chunk", Chunk: &next})
-		}
+		issues = append(issues, CheckIssue{Kind: string(IssueMissingSegment), SegmentID: segmentID, Reason: "segment file is missing"})
 	}
+	s.degradeIssuesLocked(issues, nowUnix(), &ops)
 	return s.commitMetaLocked(ops)
 }

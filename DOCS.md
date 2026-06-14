@@ -35,10 +35,10 @@ tenant/path
 状态集合：
 
 ```text
-inode:    ACTIVE, DELETED
-manifest: ACTIVE, DELETED
-chunk:    ACTIVE, GARBAGE_CANDIDATE, DELETED, CORRUPT
-segment:  SEALED, COMPACTING, DELETED, CORRUPT
+inode:    ACTIVE, DEGRADED, DELETED
+manifest: ACTIVE, DEGRADED, DELETED
+chunk:    ACTIVE, GARBAGE_CANDIDATE, MISSING, DELETED
+segment:  SEALED, COMPACTING, MISSING, DELETED
 ```
 
 ## 存储布局
@@ -255,7 +255,7 @@ MaxIssues:    返回问题数量上限
 CleanStaging
 CleanOrphans
 ResetCompacting
-MarkMissingCorrupt
+DegradeMissing
 ```
 
 txlog 截断、manifest 重建、缺失 chunk 内容重建属于调用方显式恢复流程。异常退出留下的 `LOCK` 会保护 store 独占打开语义；确认 store 所有权后，调用 `RemoveStaleLock` 或 `RemoveFSStaleLock` 显式清理。

@@ -186,6 +186,12 @@ func (s *Store) markUnreferencedChunksLocked(now, cutoff int64, confirmCycles in
 				result.CandidatesMarked++
 				changed = true
 			}
+		case chunkStateMissing:
+			next.State = chunkStateDeleted
+			next.DeletedAt = now
+			result.ChunksDeleted++
+			result.BytesMadeGarbage += chunk.StoredSize
+			changed = true
 		case chunkStateGarbageCandidate:
 			if chunk.GarbageSeenCount+1 >= confirmCycles {
 				next.State = chunkStateDeleted
@@ -218,7 +224,7 @@ func (s *Store) collectSegmentWorkLocked(segmentDeleteCutoff int64, compact bool
 				candidates = append(candidates, compactCandidate{Source: seg, Chunks: stat.LiveChunks})
 			}
 		}
-		if seg.State == segmentStateDeleted || seg.State == segmentStateCorrupt || pinned || stat.BlocksRemoval {
+		if seg.State == segmentStateDeleted || pinned || stat.BlocksRemoval {
 			continue
 		}
 		deadAt := stat.DeadAt
@@ -430,14 +436,19 @@ func (s *Store) removeSegmentFiles(ctx context.Context, segments []segmentRecord
 
 func (s *Store) collectUnreachableInodesLocked(now int64, ops *[]metaOp) {
 	reachable := map[uint64]bool{}
+
 	for _, rootID := range s.meta.Tenants {
-		s.markReachableLocked(rootID, reachable)
+		if rootID == 0 {
+			continue
+		}
+		walkDirBFSCollectLocked(s.meta, rootID, reachable)
 	}
+
 	manifestRecords := map[string]*manifestRecord{}
 	manifestDeltas := map[string]int{}
 	chunkDeltas := map[string]int{}
 	for _, inode := range s.meta.Inodes {
-		if inode.State != fileStateActive || reachable[inode.InodeID] {
+		if !inodeVisibleState(inode.State) || reachable[inode.InodeID] {
 			continue
 		}
 		next := cloneInode(inode)
@@ -454,15 +465,4 @@ func (s *Store) collectUnreachableInodesLocked(now int64, ops *[]metaOp) {
 		}
 	}
 	appendRefDeltaOpsLocked(s.meta, ops, manifestRecords, manifestDeltas, chunkDeltas, now)
-}
-
-func (s *Store) markReachableLocked(inodeID uint64, reachable map[uint64]bool) {
-	inode := s.activeInodeLocked(inodeID)
-	if inode == nil || reachable[inodeID] {
-		return
-	}
-	reachable[inodeID] = true
-	for _, childID := range s.meta.DirEntries[inodeID] {
-		s.markReachableLocked(childID, reachable)
-	}
 }

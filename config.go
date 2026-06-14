@@ -116,10 +116,43 @@ type ScrubResult struct {
 	CheckedSegments int
 	CheckedFiles    int
 	CheckedBytes    int64
-	CorruptChunks   []string
-	CorruptSegments []string
+	MissingChunks   []string
+	MissingSegments []string
+	DegradedFiles   []string
 	AffectedFiles   []string
 	Issues          []CheckIssue
+}
+
+type ImpactOptions struct {
+	TenantID     string
+	Prefix       string
+	ObjectPath   string
+	SegmentID    string
+	ChunkID      string
+	OnlyDegraded bool
+}
+
+type ImpactedObject struct {
+	TenantID        string
+	Path            string
+	State           string
+	Size            int64
+	Reason          string
+	ManifestID      string
+	MissingChunks   []string
+	MissingSegments []string
+}
+
+type ImpactReport struct {
+	AffectedTenants  []string
+	AffectedObjects  []ImpactedObject
+	AffectedChunks   []string
+	AffectedSegments []string
+	LogicalBytes     int64
+	StoredBytes      int64
+	ObjectCount      int
+	TenantCount      int
+	GeneratedAt      time.Time
 }
 
 // DefaultConfig returns production-oriented defaults for CAS chunk storage.

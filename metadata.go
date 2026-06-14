@@ -17,20 +17,22 @@ import (
 )
 
 const (
-	fileStateActive  = "ACTIVE"
-	fileStateDeleted = "DELETED"
+	fileStateActive   = "ACTIVE"
+	fileStateDegraded = "DEGRADED"
+	fileStateDeleted  = "DELETED"
 
-	manifestStateActive  = "ACTIVE"
-	manifestStateDeleted = "DELETED"
+	manifestStateActive   = "ACTIVE"
+	manifestStateDegraded = "DEGRADED"
+	manifestStateDeleted  = "DELETED"
 
 	chunkStateActive           = "ACTIVE"
-	chunkStateCorrupt          = "CORRUPT"
 	chunkStateGarbageCandidate = "GARBAGE_CANDIDATE"
+	chunkStateMissing          = "MISSING"
 	chunkStateDeleted          = "DELETED"
 
 	segmentStateSealed     = "SEALED"
-	segmentStateCorrupt    = "CORRUPT"
 	segmentStateCompacting = "COMPACTING"
+	segmentStateMissing    = "MISSING"
 	segmentStateDeleted    = "DELETED"
 
 	chunkingSingle  = "SINGLE"
@@ -73,22 +75,26 @@ type inodeRecord struct {
 	ATime               int64             `json:"atime,omitempty"`
 	CreatedAt           int64             `json:"created_at"`
 	UpdatedAt           int64             `json:"updated_at"`
+	DegradedAt          int64             `json:"degraded_at,omitempty"`
+	DegradedReason      string            `json:"degraded_reason,omitempty"`
 	DeletedAt           int64             `json:"deleted_at,omitempty"`
 }
 
 type manifestRecord struct {
-	ManifestID   string          `json:"manifest_id"`
-	TenantID     string          `json:"tenant_id"`
-	FileSize     int64           `json:"file_size"`
-	FileHash     string          `json:"file_hash"`
-	ChunkCount   int             `json:"chunk_count"`
-	ChunkingType string          `json:"chunking_type"`
-	State        string          `json:"state"`
-	RefCount     int             `json:"ref_count"`
-	Chunks       []manifestChunk `json:"chunks,omitempty"`
-	CreatedAt    int64           `json:"created_at"`
-	LastLiveAt   int64           `json:"last_live_at,omitempty"`
-	DeletedAt    int64           `json:"deleted_at,omitempty"`
+	ManifestID     string          `json:"manifest_id"`
+	TenantID       string          `json:"tenant_id"`
+	FileSize       int64           `json:"file_size"`
+	FileHash       string          `json:"file_hash"`
+	ChunkCount     int             `json:"chunk_count"`
+	ChunkingType   string          `json:"chunking_type"`
+	State          string          `json:"state"`
+	RefCount       int             `json:"ref_count"`
+	Chunks         []manifestChunk `json:"chunks,omitempty"`
+	CreatedAt      int64           `json:"created_at"`
+	LastLiveAt     int64           `json:"last_live_at,omitempty"`
+	DegradedAt     int64           `json:"degraded_at,omitempty"`
+	DegradedReason string          `json:"degraded_reason,omitempty"`
+	DeletedAt      int64           `json:"deleted_at,omitempty"`
 }
 
 type manifestChunk struct {
@@ -115,8 +121,8 @@ type chunkRecord struct {
 	LastSeenAt         int64  `json:"last_seen_at"`
 	GarbageSeenCount   int    `json:"garbage_seen_count,omitempty"`
 	GarbageCandidateAt int64  `json:"garbage_candidate_at,omitempty"`
-	CorruptAt          int64  `json:"corrupt_at,omitempty"`
-	CorruptReason      string `json:"corrupt_reason,omitempty"`
+	MissingAt          int64  `json:"missing_at,omitempty"`
+	MissingReason      string `json:"missing_reason,omitempty"`
 	DeletedAt          int64  `json:"deleted_at,omitempty"`
 }
 
@@ -129,8 +135,8 @@ type segmentRecord struct {
 	CreatedAt     int64  `json:"created_at"`
 	SealedAt      int64  `json:"sealed_at,omitempty"`
 	CompactedAt   int64  `json:"compacted_at,omitempty"`
-	CorruptAt     int64  `json:"corrupt_at,omitempty"`
-	CorruptReason string `json:"corrupt_reason,omitempty"`
+	MissingAt     int64  `json:"missing_at,omitempty"`
+	MissingReason string `json:"missing_reason,omitempty"`
 	DeletedAt     int64  `json:"deleted_at,omitempty"`
 }
 
@@ -493,6 +499,9 @@ func ensureMetaMaps(meta *metadata) {
 
 func recoverInProgressMetadata(meta *metadata) {
 	for _, seg := range meta.Segments {
+		if seg == nil {
+			continue
+		}
 		if seg.State == segmentStateCompacting {
 			seg.State = segmentStateSealed
 		}
@@ -611,7 +620,7 @@ func compactMetadata(meta *metadata) {
 	ensureMetaMaps(meta)
 	for parentID := range meta.DirEntries {
 		inode := meta.Inodes[parentID]
-		if inode == nil || inode.State != fileStateActive || inode.Kind != fileKindDir {
+		if inode == nil || !inodeVisibleState(inode.State) || inode.Kind != fileKindDir {
 			delete(meta.DirEntries, parentID)
 		}
 	}
@@ -637,7 +646,7 @@ func compactMetadata(meta *metadata) {
 
 	activeManifestRefs := map[string]bool{}
 	for _, inode := range meta.Inodes {
-		if inode != nil && inode.State == fileStateActive && inode.Kind == fileKindFile && inode.ManifestID != "" {
+		if inode != nil && inodeVisibleState(inode.State) && inode.Kind == fileKindFile && inode.ManifestID != "" {
 			activeManifestRefs[inode.ManifestID] = true
 		}
 	}

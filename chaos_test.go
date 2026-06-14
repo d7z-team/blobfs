@@ -411,6 +411,151 @@ func TestChaosScrubRunsThroughConcurrentDeletesAndGC(t *testing.T) {
 	}
 }
 
+func TestChaosLocalDegradationRepairAndDeleteFlow(t *testing.T) {
+	cfg := testConfig()
+	cfg.SegmentSize = 512
+	store, err := Open(t.TempDir(), cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/degrade", 0o755); err != nil {
+		t.Fatalf("mkdirall tenant-a: %v", err)
+	}
+	if err := store.MkdirAll("tenant-b/healthy", 0o755); err != nil {
+		t.Fatalf("mkdirall tenant-b: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "degrade/a", bytes.Repeat([]byte("A"), 64))
+	putTestBytes(t, store, "tenant-a", "degrade/b", bytes.Repeat([]byte("B"), 64))
+	putTestBytes(t, store, "tenant-b", "healthy/live", bytes.Repeat([]byte("L"), 64))
+
+	_, segment := firstChunkSnapshot(t, store, "tenant-a", "degrade/a")
+	segmentID, segmentPath := segment.SegmentID, store.segmentPath(&segment)
+	if err := store.fs.Remove(segmentPath); err != nil {
+		t.Fatalf("remove segment: %v", err)
+	}
+	if _, err := store.Repair(testContext(t), RepairOptions{Apply: true, DegradeMissing: true}); err != nil {
+		t.Fatalf("degrade missing: %v", err)
+	}
+
+	ctx := walkTimeoutContext(t, 2*time.Second)
+	rng := rand.New(rand.NewSource(0xD36AD3))
+	for step := 0; step < 24; step++ {
+		if _, err := store.OpenObject(ctx, "tenant-a", "degrade/a"); !errors.Is(err, ErrObjectDegraded) {
+			t.Fatalf("step %d open degraded err = %v", step, err)
+		}
+		impact, err := store.AssessImpact(ctx, ImpactOptions{OnlyDegraded: true})
+		if err != nil {
+			t.Fatalf("step %d assess impact: %v", step, err)
+		}
+		if impact.ObjectCount == 0 || len(impact.AffectedSegments) == 0 || impact.AffectedSegments[0] != segmentID {
+			t.Fatalf("step %d bad impact report: %+v", step, impact)
+		}
+		healthyData := chaosBytes(rng)
+		if _, err := store.Put(ctx, "tenant-b", "healthy/live", bytes.NewReader(healthyData), nil); err != nil {
+			t.Fatalf("step %d healthy put: %v", step, err)
+		}
+		if got := readTestBytes(t, store, "tenant-b", "healthy/live"); !bytes.Equal(got, healthyData) {
+			t.Fatalf("step %d healthy content mismatch", step)
+		}
+		if step%3 == 2 {
+			if _, err := store.RunGC(ctx, GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
+				t.Fatalf("step %d gc: %v", step, err)
+			}
+		}
+	}
+
+	if _, err := store.RepairObject(ctx, "tenant-a", "degrade/a", bytes.NewReader(bytes.Repeat([]byte("R"), 64)), RepairObjectOptions{}); err != nil {
+		t.Fatalf("repair degraded a: %v", err)
+	}
+	if got := readTestBytes(t, store, "tenant-a", "degrade/a"); !bytes.Equal(got, bytes.Repeat([]byte("R"), 64)) {
+		t.Fatalf("repaired content mismatch")
+	}
+	if err := store.DeleteObject(ctx, "tenant-a", "degrade/b"); err != nil {
+		t.Fatalf("delete degraded b: %v", err)
+	}
+
+	if _, err := store.RunGC(ctx, GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
+		t.Fatalf("final gc: %v", err)
+	}
+	health, err := store.Health(ctx)
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if !health.Readable || !health.Writable {
+		t.Fatalf("store should remain available: %+v", health)
+	}
+}
+
+func TestChaosMultiTenantPartialDegradationLeavesHealthyTenantsOperational(t *testing.T) {
+	cfg := testConfig()
+	cfg.SegmentSize = 512
+	dir := t.TempDir()
+	store, err := Open(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	for _, tenant := range []string{"tenant-a", "tenant-b", "tenant-c"} {
+		if err := store.MkdirAll(tenant+"/root", 0o755); err != nil {
+			t.Fatalf("mkdirall %s: %v", tenant, err)
+		}
+	}
+	putTestBytes(t, store, "tenant-a", "root/degraded", bytes.Repeat([]byte("A"), 64))
+	putTestBytes(t, store, "tenant-b", "root/live", bytes.Repeat([]byte("B"), 64))
+	putTestBytes(t, store, "tenant-c", "root/also-live", bytes.Repeat([]byte("C"), 64))
+
+	_, segment := firstChunkSnapshot(t, store, "tenant-a", "root/degraded")
+	segmentID, segmentPath := segment.SegmentID, store.segmentPath(&segment)
+	if err := store.fs.Remove(segmentPath); err != nil {
+		t.Fatalf("remove segment: %v", err)
+	}
+	if _, err := store.Repair(testContext(t), RepairOptions{Apply: true, DegradeMissing: true}); err != nil {
+		t.Fatalf("degrade missing: %v", err)
+	}
+
+	ctx := walkTimeoutContext(t, 2*time.Second)
+	rng := rand.New(rand.NewSource(0xB1057))
+	for step := 0; step < 30; step++ {
+		if _, err := store.OpenObject(ctx, "tenant-a", "root/degraded"); !errors.Is(err, ErrObjectDegraded) {
+			t.Fatalf("step %d degraded open err = %v", step, err)
+		}
+		impact, err := store.AssessImpact(ctx, ImpactOptions{OnlyDegraded: true, SegmentID: segmentID})
+		if err != nil {
+			t.Fatalf("step %d assess impact: %v", step, err)
+		}
+		if impact.ObjectCount != 1 || impact.AffectedObjects[0].TenantID != "tenant-a" {
+			t.Fatalf("step %d unexpected impact: %+v", step, impact)
+		}
+		for _, tenant := range []string{"tenant-b", "tenant-c"} {
+			payload := chaosBytes(rng)
+			path := "root/live-" + strconv.Itoa(step)
+			if tenant == "tenant-c" {
+				path = "root/also-live-" + strconv.Itoa(step)
+			}
+			if _, err := store.Put(ctx, tenant, path, bytes.NewReader(payload), nil); err != nil {
+				t.Fatalf("step %d healthy put %s: %v", step, tenant, err)
+			}
+			if got := readTestBytes(t, store, tenant, path); !bytes.Equal(got, payload) {
+				t.Fatalf("step %d healthy read mismatch for %s", step, tenant)
+			}
+		}
+		if step%5 == 0 {
+			if _, err := store.RunGC(ctx, GCOptions{CandidateConfirmCycles: 1, Compact: true}); err != nil {
+				t.Fatalf("step %d gc: %v", step, err)
+			}
+		}
+	}
+	store = reopenChaosStore(t, store, dir, cfg)
+	health, err := store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("health after reopen: %v", err)
+	}
+	if health.State != HealthDegraded || health.DegradedObjects != 1 {
+		t.Fatalf("unexpected health after reopen: %+v", health)
+	}
+}
+
 func chaosPath(rng *rand.Rand) string {
 	return fmt.Sprintf("chaos/%c/file-%02d", 'a'+rng.Intn(3), rng.Intn(16))
 }

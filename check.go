@@ -93,7 +93,7 @@ func (s *Store) checkObject(ctx context.Context, tenantID, path string) (*CheckR
 	}
 	if len(result.Issues) > 0 {
 		result.Healthy = false
-		if err := s.markCorruption(result.Issues); err != nil {
+		if err := s.applyDegradation(ctx, result.Issues); err != nil {
 			return result, err
 		}
 		return result, ErrCorrupt
@@ -175,7 +175,7 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 	}
 	if opts.CheckFiles {
 		for inodeID, inode := range s.meta.Inodes {
-			if inode == nil || inode.State != fileStateActive || inode.Kind != fileKindFile {
+			if inode == nil || !inodeVisibleState(inode.State) || inode.Kind != fileKindFile {
 				continue
 			}
 			path, pathErr := s.pathForInodeLocked(inodeID)
@@ -230,8 +230,9 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 
 	result := &ScrubResult{Healthy: true}
 	seenSegments := map[string]bool{}
-	seenCorruptChunks := map[string]bool{}
-	seenCorruptSegments := map[string]bool{}
+	seenMissingChunks := map[string]bool{}
+	seenMissingSegments := map[string]bool{}
+	seenDegradedFiles := map[string]bool{}
 	seenAffected := map[string]bool{}
 	for _, issue := range metadataIssues {
 		result.Issues = append(result.Issues, issue)
@@ -255,15 +256,16 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 		}
 		result.Issues = append(result.Issues, *issue)
 		if issue.ChunkID != "" {
-			seenCorruptChunks[issue.ChunkID] = true
+			seenMissingChunks[issue.ChunkID] = true
 			paths, pathIssues := s.pathsForChunk(issue.ChunkID)
 			result.Issues = append(result.Issues, pathIssues...)
 			for _, fileKey := range paths {
 				seenAffected[fileKey] = true
+				seenDegradedFiles[fileKey] = true
 			}
 		}
 		if issue.SegmentID != "" {
-			seenCorruptSegments[issue.SegmentID] = true
+			seenMissingSegments[issue.SegmentID] = true
 		}
 	}
 	for _, fileSnap := range fileSnapshots {
@@ -298,29 +300,34 @@ func (s *Store) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubResult, err
 		for _, issue := range fileIssues {
 			result.Issues = append(result.Issues, issue)
 			if issue.ChunkID != "" {
-				seenCorruptChunks[issue.ChunkID] = true
+				seenMissingChunks[issue.ChunkID] = true
 			}
 			if issue.SegmentID != "" {
-				seenCorruptSegments[issue.SegmentID] = true
+				seenMissingSegments[issue.SegmentID] = true
 			}
 			seenAffected[fileSnap.TenantID+"/"+fileSnap.Path] = true
+			seenDegradedFiles[fileSnap.TenantID+"/"+fileSnap.Path] = true
 		}
 	}
-	for id := range seenCorruptChunks {
-		result.CorruptChunks = append(result.CorruptChunks, id)
+	for id := range seenMissingChunks {
+		result.MissingChunks = append(result.MissingChunks, id)
 	}
-	for id := range seenCorruptSegments {
-		result.CorruptSegments = append(result.CorruptSegments, id)
+	for id := range seenMissingSegments {
+		result.MissingSegments = append(result.MissingSegments, id)
+	}
+	for key := range seenDegradedFiles {
+		result.DegradedFiles = append(result.DegradedFiles, key)
 	}
 	for key := range seenAffected {
 		result.AffectedFiles = append(result.AffectedFiles, key)
 	}
-	sort.Strings(result.CorruptChunks)
-	sort.Strings(result.CorruptSegments)
+	sort.Strings(result.MissingChunks)
+	sort.Strings(result.MissingSegments)
+	sort.Strings(result.DegradedFiles)
 	sort.Strings(result.AffectedFiles)
 	if len(result.Issues) > 0 {
 		result.Healthy = false
-		if err := s.markCorruption(result.Issues); err != nil {
+		if err := s.applyDegradation(ctx, result.Issues); err != nil {
 			return result, err
 		}
 		return result, ErrCorrupt
@@ -334,7 +341,7 @@ func (s *Store) pathsForChunk(chunkID string) ([]string, []CheckIssue) {
 	var paths []string
 	var issues []CheckIssue
 	for _, inode := range s.meta.Inodes {
-		if inode == nil || inode.State != fileStateActive || inode.Kind != fileKindFile {
+		if inode == nil || !inodeVisibleState(inode.State) || inode.Kind != fileKindFile {
 			continue
 		}
 		manifest := s.meta.Manifests[inode.ManifestID]
@@ -368,11 +375,11 @@ func (s *Store) checkChunkSnapshot(snap chunkCheckSnapshot) ([]byte, *CheckIssue
 	if !snap.HasSeg {
 		return nil, &CheckIssue{Kind: "segment_missing", Path: snap.Path, TenantID: snap.TenantID, ChunkID: snap.Chunk.ChunkID, SegmentID: snap.Chunk.SegmentID, Reason: "segment metadata is missing"}
 	}
-	if snap.Chunk.State == chunkStateCorrupt {
-		return nil, &CheckIssue{Kind: "chunk_corrupt", Path: snap.Path, TenantID: snap.TenantID, ChunkID: snap.Chunk.ChunkID, SegmentID: snap.Chunk.SegmentID, Reason: snap.Chunk.CorruptReason}
+	if snap.Chunk.State == chunkStateMissing {
+		return nil, &CheckIssue{Kind: string(IssueMissingChunk), Path: snap.Path, TenantID: snap.TenantID, ChunkID: snap.Chunk.ChunkID, SegmentID: snap.Chunk.SegmentID, Reason: snap.Chunk.MissingReason}
 	}
-	if snap.Segment.State == segmentStateCorrupt {
-		return nil, &CheckIssue{Kind: "segment_corrupt", Path: snap.Path, TenantID: snap.TenantID, ChunkID: snap.Chunk.ChunkID, SegmentID: snap.Segment.SegmentID, Reason: snap.Segment.CorruptReason}
+	if snap.Segment.State == segmentStateMissing {
+		return nil, &CheckIssue{Kind: string(IssueMissingSegment), Path: snap.Path, TenantID: snap.TenantID, ChunkID: snap.Chunk.ChunkID, SegmentID: snap.Segment.SegmentID, Reason: snap.Segment.MissingReason}
 	}
 	raw, err := s.readChunkPayloadAt(snap.Segment, snap.Chunk)
 	if err != nil {
@@ -389,34 +396,6 @@ func (s *Store) checkChunkSnapshot(snap chunkCheckSnapshot) ([]byte, *CheckIssue
 		return nil, &CheckIssue{Kind: "chunk_hash_mismatch", Path: snap.Path, TenantID: snap.TenantID, ChunkID: snap.Chunk.ChunkID, SegmentID: snap.Segment.SegmentID, Reason: "chunk sha256 mismatch"}
 	}
 	return raw, nil
-}
-
-func (s *Store) markCorruption(issues []CheckIssue) error {
-	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
-	now := nowUnix()
-	ops := make([]metaOp, 0, len(issues)*2)
-	for _, issue := range issues {
-		if issue.ChunkID != "" {
-			if chunk := s.meta.Chunks[issue.ChunkID]; chunk != nil && chunk.State != chunkStateDeleted {
-				next := *chunk
-				next.State = chunkStateCorrupt
-				next.CorruptAt = now
-				next.CorruptReason = issue.Reason
-				ops = append(ops, metaOp{Type: "put_chunk", Chunk: &next})
-			}
-		}
-		if issue.SegmentID != "" {
-			if seg := s.meta.Segments[issue.SegmentID]; seg != nil && seg.State != segmentStateDeleted {
-				next := *seg
-				next.State = segmentStateCorrupt
-				next.CorruptAt = now
-				next.CorruptReason = issue.Reason
-				ops = append(ops, metaOp{Type: "put_segment", Segment: &next})
-			}
-		}
-	}
-	return s.commitMetaLocked(ops)
 }
 
 func (s *Store) pathForInodeLocked(id uint64) (string, error) {

@@ -15,6 +15,7 @@ var (
 	ErrTooLarge                 = errors.New("file too large")
 	ErrTooManyOpenWriteSessions = errors.New("too many open write sessions")
 	ErrCorrupt                  = errors.New("blobfs corruption detected")
+	ErrObjectDegraded           = errors.New("object is degraded")
 	ErrNilContext               = errors.New("context is nil")
 	ErrNilFilesystem            = errors.New("filesystem is nil")
 	ErrNilReader                = errors.New("input reader is nil")

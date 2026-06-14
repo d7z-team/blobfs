@@ -180,7 +180,7 @@ func (s *Store) Mkdir(name string, perm os.FileMode) error {
 	}
 	if path == "" {
 		s.metaMu.RLock()
-		tenantExists := s.meta.Tenants[tenantID] != 0 && s.activeInodeLocked(s.meta.Tenants[tenantID]) != nil
+		tenantExists := s.meta.Tenants[tenantID] != 0 && s.visibleInodeLocked(s.meta.Tenants[tenantID]) != nil
 		s.metaMu.RUnlock()
 		if tenantExists {
 			return exists("mkdir", name)
@@ -196,7 +196,7 @@ func (s *Store) Mkdir(name string, perm os.FileMode) error {
 	if err != nil {
 		return pathError("mkdir", name, err)
 	}
-	if child := s.meta.DirEntries[parentID][base]; child != 0 && s.activeInodeLocked(child) != nil {
+	if child := s.meta.DirEntries[parentID][base]; child != 0 && s.visibleInodeLocked(child) != nil {
 		return exists("mkdir", name)
 	}
 	now := nowUnix()
@@ -249,7 +249,7 @@ func (s *Store) MkdirAll(name string, perm os.FileMode) error {
 	pendingDirs := map[uint64]*inodeRecord{}
 	ops := []metaOp{}
 	for _, part := range strings.Split(path, "/") {
-		current := s.activeInodeLocked(currentID)
+		current := s.visibleInodeLocked(currentID)
 		if current == nil {
 			current = pendingDirs[currentID]
 		}
@@ -258,7 +258,7 @@ func (s *Store) MkdirAll(name string, perm os.FileMode) error {
 		}
 		childID := s.meta.DirEntries[currentID][part]
 		if childID != 0 {
-			child := s.activeInodeLocked(childID)
+			child := s.visibleInodeLocked(childID)
 			if child == nil {
 				return pathError("mkdir", name, fs.ErrNotExist)
 			}
@@ -418,7 +418,7 @@ func (s *Store) Rename(oldname, newname string) error {
 		return pathError("rename", newname, fs.ErrInvalid)
 	}
 	targetID := s.meta.DirEntries[newParentID][newBase]
-	target := s.activeInodeLocked(targetID)
+	target := s.visibleInodeLocked(targetID)
 	now := nowUnix()
 	ops := []metaOp{{Type: "delete_dirent", ParentID: oldParentID, Name: oldBase}}
 	if target != nil {
@@ -582,7 +582,7 @@ func (s *Store) listDir(tenantID, path string, root bool) []os.FileInfo {
 		return nil
 	}
 	for _, name := range sortedNames(s.meta.DirEntries[dir.InodeID]) {
-		child := s.activeInodeLocked(s.meta.DirEntries[dir.InodeID][name])
+		child := s.visibleInodeLocked(s.meta.DirEntries[dir.InodeID][name])
 		if child != nil {
 			info := fileInfoFromInode(child)
 			info.name = name

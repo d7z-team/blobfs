@@ -132,7 +132,7 @@ func TestPutReusedLiveChunkSurvivesInterleavedGC(t *testing.T) {
 	}
 }
 
-func TestPutRevivesCorruptChunkWithoutRefCountDrift(t *testing.T) {
+func TestRepairObjectRestoresDegradedObject(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/revive", 0o755); err != nil {
 		t.Fatalf("mkdirall: %v", err)
@@ -143,12 +143,12 @@ func TestPutRevivesCorruptChunkWithoutRefCountDrift(t *testing.T) {
 	var chunkID string
 	for id, chunk := range store.meta.Chunks {
 		next := *chunk
-		next.State = chunkStateCorrupt
-		next.CorruptAt = nowUnix()
-		next.CorruptReason = "test corrupt chunk"
+		next.State = chunkStateMissing
+		next.MissingAt = nowUnix()
+		next.MissingReason = "test missing chunk"
 		if err := store.commitMetaLocked([]metaOp{{Type: "put_chunk", Chunk: &next}}); err != nil {
 			store.metaMu.Unlock()
-			t.Fatalf("mark corrupt: %v", err)
+			t.Fatalf("mark missing: %v", err)
 		}
 		chunkID = id
 		break
@@ -157,15 +157,22 @@ func TestPutRevivesCorruptChunkWithoutRefCountDrift(t *testing.T) {
 	if chunkID == "" {
 		t.Fatal("expected chunk")
 	}
-
-	putTestBytes(t, store, "tenant-a", "revive/original", data)
+	if err := store.applyDegradation(testContext(t), []CheckIssue{{Kind: string(IssueMissingChunk), ChunkID: chunkID, Reason: "test missing chunk"}}); err != nil {
+		t.Fatalf("apply degradation: %v", err)
+	}
+	if _, err := store.Put(testContext(t), "tenant-a", "revive/original", bytes.NewReader(data), nil); !errors.Is(err, ErrObjectDegraded) {
+		t.Fatalf("put degraded object err = %v, want ErrObjectDegraded", err)
+	}
+	if _, err := store.RepairObject(testContext(t), "tenant-a", "revive/original", bytes.NewReader(data), RepairObjectOptions{}); err != nil {
+		t.Fatalf("repair degraded object: %v", err)
+	}
 	putTestBytes(t, store, "tenant-a", "revive/second", data)
 
 	store.metaMu.RLock()
 	chunk := store.meta.Chunks[chunkID]
 	store.metaMu.RUnlock()
 	if chunk == nil || chunk.State != chunkStateActive || chunk.RefCount != 2 {
-		t.Fatalf("revived chunk = %+v, want active refcount 2", chunk)
+		t.Fatalf("repaired chunk = %+v, want active refcount 2", chunk)
 	}
 	if got := readTestBytes(t, store, "tenant-a", "revive/original"); !bytes.Equal(got, data) {
 		t.Fatalf("original content mismatch")
@@ -175,7 +182,23 @@ func TestPutRevivesCorruptChunkWithoutRefCountDrift(t *testing.T) {
 	}
 }
 
-func TestGCSkipsCorruptUnreferencedChunksWithoutNoopTransaction(t *testing.T) {
+func TestRepairObjectRejectsHealthyOrMissingTarget(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/repair", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	data := []byte("repair-target")
+	putTestBytes(t, store, "tenant-a", "repair/healthy", data)
+
+	if _, err := store.RepairObject(testContext(t), "tenant-a", "repair/healthy", bytes.NewReader(data), RepairObjectOptions{}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("repair healthy err = %v, want ErrConflict", err)
+	}
+	if _, err := store.RepairObject(testContext(t), "tenant-a", "repair/missing", bytes.NewReader(data), RepairObjectOptions{}); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("repair missing err = %v, want fs.ErrNotExist", err)
+	}
+}
+
+func TestGCDeletesMissingUnreferencedChunks(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/gc", 0o755); err != nil {
 		t.Fatalf("mkdirall: %v", err)
@@ -188,9 +211,9 @@ func TestGCSkipsCorruptUnreferencedChunksWithoutNoopTransaction(t *testing.T) {
 	var ops []metaOp
 	for _, chunk := range store.meta.Chunks {
 		next := *chunk
-		next.State = chunkStateCorrupt
-		next.CorruptAt = nowUnix()
-		next.CorruptReason = "test corrupt chunk"
+		next.State = chunkStateMissing
+		next.MissingAt = nowUnix()
+		next.MissingReason = "test missing chunk"
 		ops = append(ops, metaOp{Type: "put_chunk", Chunk: &next})
 		break
 	}
@@ -200,7 +223,7 @@ func TestGCSkipsCorruptUnreferencedChunksWithoutNoopTransaction(t *testing.T) {
 	}
 	if err := store.commitMetaLocked(ops); err != nil {
 		store.metaMu.Unlock()
-		t.Fatalf("mark corrupt: %v", err)
+		t.Fatalf("mark missing: %v", err)
 	}
 	before := store.meta.TxID
 	store.metaMu.Unlock()
@@ -211,9 +234,14 @@ func TestGCSkipsCorruptUnreferencedChunksWithoutNoopTransaction(t *testing.T) {
 	}
 	store.metaMu.RLock()
 	txDelta := store.meta.TxID - before
+	var state string
+	for _, chunk := range store.meta.Chunks {
+		state = chunk.State
+		break
+	}
 	store.metaMu.RUnlock()
-	if result.ChunksDeleted != 0 || txDelta != 2 {
-		t.Fatalf("gc wrote unexpected corrupt chunk update: result=%+v txDelta=%d", result, txDelta)
+	if result.ChunksDeleted != 1 || result.SegmentsDeleted != 1 || txDelta != 4 || state != chunkStateDeleted {
+		t.Fatalf("gc failed to delete missing chunk: result=%+v txDelta=%d state=%s", result, txDelta, state)
 	}
 	stats, err := store.Stats(testContext(t))
 	if err != nil {
@@ -221,6 +249,67 @@ func TestGCSkipsCorruptUnreferencedChunksWithoutNoopTransaction(t *testing.T) {
 	}
 	if stats.GC.LastRunState != "DONE" {
 		t.Fatalf("gc run state = %q, want DONE", stats.GC.LastRunState)
+	}
+}
+
+func TestDeleteDegradedObjectReclaimsMissingResources(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/reclaim", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "reclaim/blob", bytes.Repeat([]byte("r"), 64))
+	segmentID, segmentPath := firstSegmentPath(t, store)
+	if err := store.fs.Remove(segmentPath); err != nil {
+		t.Fatalf("remove segment: %v", err)
+	}
+	if _, err := store.Repair(testContext(t), RepairOptions{Apply: true, DegradeMissing: true}); err != nil {
+		t.Fatalf("degrade missing: %v", err)
+	}
+	if err := store.DeleteObject(testContext(t), "tenant-a", "reclaim/blob"); err != nil {
+		t.Fatalf("delete degraded object: %v", err)
+	}
+	result, err := store.RunGC(testContext(t), GCOptions{CandidateConfirmCycles: 1, Compact: true})
+	if err != nil {
+		t.Fatalf("gc after delete: %v", err)
+	}
+	if result.ChunksDeleted == 0 || result.SegmentsDeleted == 0 {
+		t.Fatalf("expected missing resources to be reclaimed: %+v", result)
+	}
+	store.metaMu.RLock()
+	defer store.metaMu.RUnlock()
+	if seg := store.meta.Segments[segmentID]; seg == nil || seg.State != segmentStateDeleted {
+		t.Fatalf("segment not deleted: %+v", seg)
+	}
+	for _, inode := range store.meta.Inodes {
+		if inode != nil && inode.Name == "blob" && inode.State != fileStateDeleted {
+			t.Fatalf("inode should stay deleted: %+v", inode)
+		}
+	}
+}
+
+func TestRepairObjectHonorsGenerationOnDegradedObject(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/generation", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	put := putTestBytes(t, store, "tenant-a", "generation/blob", []byte("old"))
+	_, segmentPath := firstSegmentPath(t, store)
+	if err := store.fs.Remove(segmentPath); err != nil {
+		t.Fatalf("remove segment: %v", err)
+	}
+	if _, err := store.Repair(testContext(t), RepairOptions{Apply: true, DegradeMissing: true}); err != nil {
+		t.Fatalf("degrade missing: %v", err)
+	}
+
+	if _, err := store.RepairObject(testContext(t), "tenant-a", "generation/blob", bytes.NewReader([]byte("new")), RepairObjectOptions{BaseGeneration: put.Generation + 1}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("repair with wrong generation err = %v, want ErrConflict", err)
+	}
+	result, err := store.RepairObject(testContext(t), "tenant-a", "generation/blob", bytes.NewReader([]byte("new")), RepairObjectOptions{BaseGeneration: put.Generation})
+	if err != nil {
+		t.Fatalf("repair with correct generation: %v", err)
+	}
+	if result.Generation <= put.Generation {
+		t.Fatalf("generation did not advance: before=%d after=%d", put.Generation, result.Generation)
 	}
 }
 
@@ -298,10 +387,10 @@ func TestWriteSessionLimitReleasedAfterOpenFailure(t *testing.T) {
 	manifest := store.meta.Manifests[put.ManifestID]
 	chunk := store.meta.Chunks[manifest.Chunks[0].ChunkID]
 	next := *chunk
-	next.State = chunkStateCorrupt
+	next.State = chunkStateMissing
 	if err := store.commitMetaLocked([]metaOp{{Type: "put_chunk", Chunk: &next}}); err != nil {
 		store.metaMu.Unlock()
-		t.Fatalf("mark corrupt: %v", err)
+		t.Fatalf("mark missing: %v", err)
 	}
 	store.metaMu.Unlock()
 	if file, err := store.OpenFile("tenant-a/sessions/blob", os.O_RDWR, 0o644); err == nil {

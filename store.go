@@ -77,6 +77,11 @@ type PutResult struct {
 	Generation   uint64
 }
 
+type RepairObjectOptions struct {
+	BaseGeneration uint64
+	Options        map[string]string
+}
+
 // ObjectInfo describes an active file and its user metadata.
 type ObjectInfo struct {
 	FileID     string
@@ -85,6 +90,10 @@ type ObjectInfo struct {
 	Size       int64
 	FileHash   string
 	ManifestID string
+	State      string
+	Readable   bool
+	Writable   bool
+	Reason     string
 	Generation uint64
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
@@ -109,6 +118,8 @@ type preparedObject struct {
 type putCommitOptions struct {
 	baseGeneration  uint64
 	checkGeneration bool
+	allowDegraded   bool
+	requireDegraded bool
 	mode            os.FileMode
 	modTime         int64
 	options         map[string]string
@@ -309,6 +320,16 @@ func (s *Store) closeHandles() error {
 // Put stores or replaces a file and records optional string metadata.
 func (s *Store) Put(ctx context.Context, tenantID, path string, input io.Reader, options map[string]string) (*PutResult, error) {
 	return s.putObject(ctx, tenantID, path, input, putCommitOptions{options: copyOptions(options)})
+}
+
+func (s *Store) RepairObject(ctx context.Context, tenantID, path string, input io.Reader, opts RepairObjectOptions) (*PutResult, error) {
+	return s.putObject(ctx, tenantID, path, input, putCommitOptions{
+		baseGeneration:  opts.BaseGeneration,
+		checkGeneration: opts.BaseGeneration != 0,
+		allowDegraded:   true,
+		requireDegraded: true,
+		options:         copyOptions(opts.Options),
+	})
 }
 
 func (s *Store) putObject(ctx context.Context, tenantID, path string, input io.Reader, opts putCommitOptions) (*PutResult, error) {
@@ -512,10 +533,21 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 	}
 	var existing *inodeRecord
 	if childID := s.meta.DirEntries[parentID][name]; childID != 0 {
-		existing = s.activeInodeLocked(childID)
+		existing = s.visibleInodeLocked(childID)
 	}
 	if existing != nil && existing.Kind != fileKindFile {
 		return nil, pathError("put", prepared.path, ErrIsDir)
+	}
+	if opts.requireDegraded {
+		if existing == nil {
+			return nil, notExist("repair", prepared.path)
+		}
+		if existing.State != fileStateDegraded {
+			return nil, ErrConflict
+		}
+	}
+	if existing != nil && existing.State == fileStateDegraded && !opts.allowDegraded {
+		return nil, ErrObjectDegraded
 	}
 	if opts.checkGeneration {
 		if opts.baseGeneration == 0 && existing != nil {
@@ -536,7 +568,7 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 		current := s.meta.Chunks[chunkID]
 		segment := s.meta.Segments[chunk.SegmentID]
 		if current == nil || current.State != chunkStateActive ||
-			segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateCorrupt {
+			segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateMissing {
 			return nil, errChunkNotReadable
 		}
 	}
@@ -557,7 +589,7 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 		chunkCopy := *chunk
 		if newChunkRef[chunkCopy.ChunkID] {
 			chunkCopy.RefCount = 0
-			if current != nil && current.State == chunkStateCorrupt {
+			if current != nil && current.State == chunkStateMissing {
 				chunkCopy.RefCount = current.RefCount
 			}
 		}
@@ -609,6 +641,8 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 	inode.ManifestID = manifest.ManifestID
 	inode.Kind = fileKindFile
 	inode.State = fileStateActive
+	inode.DegradedAt = 0
+	inode.DegradedReason = ""
 	inode.Options = copyOptions(opts.options)
 	inode.Mode = uint32(s.regularFileMode(opts.mode))
 	inode.ModTime = opts.modTime
@@ -951,9 +985,25 @@ func (s *Store) nextInodeIDLocked() uint64 {
 	return id
 }
 
+func inodeVisibleState(state string) bool {
+	return state == fileStateActive || state == fileStateDegraded
+}
+
+func manifestVisibleState(state string) bool {
+	return state == manifestStateActive || state == manifestStateDegraded
+}
+
 func (s *Store) activeInodeLocked(id uint64) *inodeRecord {
 	inode := s.meta.Inodes[id]
 	if inode == nil || inode.State != fileStateActive {
+		return nil
+	}
+	return inode
+}
+
+func (s *Store) visibleInodeLocked(id uint64) *inodeRecord {
+	inode := s.meta.Inodes[id]
+	if inode == nil || !inodeVisibleState(inode.State) {
 		return nil
 	}
 	return inode
@@ -964,7 +1014,7 @@ func (s *Store) resolvePathLocked(tenantID, path string) (*inodeRecord, error) {
 	if rootID == 0 {
 		return nil, fs.ErrNotExist
 	}
-	current := s.activeInodeLocked(rootID)
+	current := s.visibleInodeLocked(rootID)
 	if current == nil {
 		return nil, fs.ErrNotExist
 	}
@@ -979,7 +1029,7 @@ func (s *Store) resolvePathLocked(tenantID, path string) (*inodeRecord, error) {
 		if childID == 0 {
 			return nil, fs.ErrNotExist
 		}
-		current = s.activeInodeLocked(childID)
+		current = s.visibleInodeLocked(childID)
 		if current == nil {
 			return nil, fs.ErrNotExist
 		}
@@ -1015,7 +1065,7 @@ func (s *Store) pinChunkSnapshot(chunkID string) *chunkRecord {
 		return nil
 	}
 	segment := s.meta.Segments[chunk.SegmentID]
-	if segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateCorrupt {
+	if segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateMissing {
 		return nil
 	}
 	s.pinSegment(chunk.SegmentID)
@@ -1056,7 +1106,9 @@ func appendRefDeltaOpsLocked(meta *metadata, ops *[]metaOp, manifestRecords map[
 			next.State = manifestStateDeleted
 			next.DeletedAt = now
 		} else {
-			next.State = manifestStateActive
+			if next.State != manifestStateDegraded {
+				next.State = manifestStateActive
+			}
 			next.DeletedAt = 0
 			next.LastLiveAt = now
 		}
@@ -1083,7 +1135,9 @@ func appendRefDeltaOpsLocked(meta *metadata, ops *[]metaOp, manifestRecords map[
 			next.RefCount = 0
 		}
 		if next.RefCount > 0 {
-			next.State = chunkStateActive
+			if next.State != chunkStateMissing {
+				next.State = chunkStateActive
+			}
 			next.LastSeenAt = now
 			next.DeletedAt = 0
 			next.GarbageCandidateAt = 0
@@ -1124,6 +1178,10 @@ func objectInfoFromInode(inode *inodeRecord, path string) ObjectInfo {
 		Size:       inode.Size,
 		FileHash:   inode.FileHash,
 		ManifestID: inode.ManifestID,
+		State:      inode.State,
+		Readable:   inode.State == fileStateActive,
+		Writable:   inode.State == fileStateActive,
+		Reason:     inode.DegradedReason,
 		Generation: inode.Generation,
 		CreatedAt:  time.Unix(0, inode.CreatedAt),
 		UpdatedAt:  time.Unix(0, inode.UpdatedAt),

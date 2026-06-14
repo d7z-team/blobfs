@@ -47,9 +47,15 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 	if inode.Kind != fileKindFile {
 		return nil, pathError("open", path, ErrIsDir)
 	}
+	if inode.State == fileStateDegraded {
+		return nil, ErrObjectDegraded
+	}
 	manifest := s.meta.Manifests[inode.ManifestID]
 	if manifest == nil || manifest.State == manifestStateDeleted {
 		return nil, errManifestNotFound
+	}
+	if manifest.State == manifestStateDegraded {
+		return nil, ErrObjectDegraded
 	}
 	refs := append([]manifestChunk(nil), manifest.Chunks...)
 	sort.Slice(refs, func(i, j int) bool {
@@ -58,11 +64,11 @@ func (s *Store) openReader(tenantID, path string, rangeOffset, rangeLength int64
 	snapshots := make([]chunkSnapshot, 0, len(refs))
 	for _, ref := range refs {
 		chunk := s.meta.Chunks[ref.ChunkID]
-		if chunk == nil || chunk.State == chunkStateDeleted || chunk.State == chunkStateCorrupt {
+		if chunk == nil || chunk.State == chunkStateDeleted || chunk.State == chunkStateMissing {
 			return nil, errChunkNotReadable
 		}
 		seg := s.meta.Segments[chunk.SegmentID]
-		if seg == nil || seg.State == segmentStateDeleted || seg.State == segmentStateCorrupt {
+		if seg == nil || seg.State == segmentStateDeleted || seg.State == segmentStateMissing {
 			return nil, errChunkNotReadable
 		}
 		snapshots = append(snapshots, chunkSnapshot{Ref: ref, Chunk: *chunk, Segment: *seg})

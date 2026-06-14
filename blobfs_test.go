@@ -781,7 +781,7 @@ func TestPublicAPIVFSSmokeAndBoundaries(t *testing.T) {
 	}
 }
 
-func TestCheckObjectMarksCorruptSegment(t *testing.T) {
+func TestCheckObjectDegradesObjectAndMarksMissingResources(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.MkdirAll("tenant-a/corrupt", 0o755); err != nil {
 		t.Fatalf("mkdirall: %v", err)
@@ -797,11 +797,18 @@ func TestCheckObjectMarksCorruptSegment(t *testing.T) {
 	}
 	store.metaMu.RLock()
 	defer store.metaMu.RUnlock()
-	if store.meta.Chunks[chunk.ChunkID].State != chunkStateCorrupt {
-		t.Fatalf("chunk not marked corrupt")
+	if store.meta.Chunks[chunk.ChunkID].State != chunkStateMissing {
+		t.Fatalf("chunk not marked missing")
 	}
-	if store.meta.Segments[segment.SegmentID].State != segmentStateCorrupt {
-		t.Fatalf("segment not marked corrupt")
+	if store.meta.Segments[segment.SegmentID].State != segmentStateMissing {
+		t.Fatalf("segment not marked missing")
+	}
+	inode, err := store.resolvePathLocked("tenant-a", "corrupt/blob")
+	if err != nil {
+		t.Fatalf("resolve degraded object: %v", err)
+	}
+	if inode.State != fileStateDegraded {
+		t.Fatalf("inode not degraded: %+v", inode)
 	}
 }
 
