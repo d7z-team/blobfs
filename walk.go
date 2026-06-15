@@ -7,32 +7,32 @@ import (
 	"sync"
 )
 
-// TenantCount 租户级别统计（用于进度估算和显示）
+// TenantCount holds per-tenant statistics used for progress estimation.
 type TenantCount struct {
-	TenantID       string // 租户ID
-	TotalInodes    int64  // inode 总数
-	TotalDirs      int64  // 目录数
-	TotalFiles     int64  // 文件数
-	TotalBytes     int64  // 文件逻辑大小
-	EstimatedTotal int64  // 全局预估总数（用于进度百分比）
+	TenantID       string // tenant ID
+	TotalInodes    int64  // total inode count
+	TotalDirs      int64  // directory count
+	TotalFiles     int64  // file count
+	TotalBytes     int64  // logical file size
+	EstimatedTotal int64  // global estimate for progress percentage
 }
 
-// walkResult 遍历结果项
+// walkResult represents a single item in walk traversal.
 type walkResult struct {
 	TenantID string
 	Inode    inodeRecord
 	Depth    int
 }
 
-// WalkFunc 遍历回调
-// 返回 false 表示尽快终止遍历。
+// WalkFunc is the callback for each walked inode.
+// Returns false to abort traversal as soon as possible.
 type WalkFunc func(result walkResult) bool
 
-// WalkOptions 遍历选项
+// WalkOptions controls walk behavior.
 type WalkOptions struct {
-	Workers        int  // 并行 worker 数（默认 runtime.NumCPU）
-	BatchSize      int  // channel 缓冲大小（默认 10000）
-	IncludeDeleted bool // 是否包含 DELETED 状态 inode
+	Workers        int  // parallel worker count (default runtime.NumCPU)
+	BatchSize      int  // channel buffer size (default 10000)
+	IncludeDeleted bool // include DELETED state inodes
 }
 
 type walkSnapshot struct {
@@ -131,7 +131,7 @@ func (snap *walkSnapshot) countTenant(tenantID string) *TenantCount {
 	return count
 }
 
-// CountAll 统计所有租户的 inode 数量（用于进度估算）
+// CountAll counts inodes across all tenants (for progress estimation).
 func (s *Store) CountAll(ctx context.Context) (map[string]*TenantCount, error) {
 	if err := s.beginOp(ctx); err != nil {
 		return nil, err
@@ -161,8 +161,9 @@ func (s *Store) CountAll(ctx context.Context) (map[string]*TenantCount, error) {
 	return counts, nil
 }
 
-// WalkAll 遍历所有租户下的所有 inode。
-// 遍历基于只读快照，不保证顺序，结果为最终一致视图。
+// WalkAll walks all inodes across all tenants.
+// Walk operates on a read-only snapshot; order is not guaranteed.
+// Results represent a point-in-time consistent view.
 func (s *Store) WalkAll(ctx context.Context, fn WalkFunc, opts *WalkOptions) error {
 	if err := s.beginOp(ctx); err != nil {
 		return err
@@ -183,7 +184,7 @@ func (s *Store) WalkAll(ctx context.Context, fn WalkFunc, opts *WalkOptions) err
 	return walkSnapshotRoots(ctx, snapshot, roots, fn, normalizeWalkOptions(opts))
 }
 
-// WalkTenant 遍历单个租户。
+// WalkTenant walks all inodes under a single tenant.
 func (s *Store) WalkTenant(ctx context.Context, tenantID string, fn WalkFunc, opts *WalkOptions) error {
 	if err := s.beginOp(ctx); err != nil {
 		return err
@@ -241,7 +242,7 @@ func walkSnapshotRoots(ctx context.Context, snap *walkSnapshot, roots []walkRoot
 	return ctx.Err()
 }
 
-// walkDirBFS 非递归 BFS 遍历
+// walkDirBFS performs non-recursive BFS traversal.
 func walkDirBFS(ctx context.Context, snap *walkSnapshot, root walkRoot, includeDeleted bool, work chan<- walkResult) {
 	if root.inodeID == 0 {
 		return
@@ -289,8 +290,8 @@ func walkDirBFS(ctx context.Context, snap *walkSnapshot, root walkRoot, includeD
 	}
 }
 
-// walkDirBFSCollect 非递归 BFS 遍历，收集可达 inode 到 map（用于 GC）
-// caller must hold metaMu
+// walkDirBFSCollectLocked performs non-recursive BFS traversal and collects reachable inodes.
+// Caller must hold metaMu.
 func walkDirBFSCollectLocked(meta *metadata, inodeID uint64, reachable map[uint64]bool) {
 	if inodeID == 0 || reachable[inodeID] {
 		return
