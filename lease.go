@@ -171,6 +171,9 @@ func (s *Store) getSegmentSafetyInfo(segmentID string) *SegmentSafetyInfo {
 	if seg != nil {
 		info.State = seg.State
 		info.CanBeDeleted = !hasLease && seg.State != segmentStateDeleted && seg.State != segmentStateCompacting
+		if hasLease {
+			info.SafetyCutoff = expiresAt
+		}
 	} else {
 		info.State = "NOT_FOUND"
 		info.CanBeDeleted = false
