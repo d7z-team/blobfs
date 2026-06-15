@@ -217,6 +217,9 @@ func (s *Store) collectSegmentWorkLocked(segmentDeleteCutoff int64, compact bool
 	var deadSegments []segmentRecord
 	for _, stat := range stats {
 		seg := stat.Segment
+		if s.getActiveLease(seg.SegmentID) != nil {
+			continue
+		}
 		pinned := s.segmentPinned(seg.SegmentID)
 		if compact && seg.State == segmentStateSealed && !pinned {
 			total := stat.LiveBytes + stat.GarbageBytes
@@ -390,7 +393,7 @@ func (s *Store) commitCompactionResults(results []compactResult, gcResult *GCRes
 		nextSource := *source
 		nextSource.State = segmentStateSealed
 		nextSource.CompactedAt = now
-		if !s.segmentPinned(source.SegmentID) && nextSource.CompactedAt <= segmentDeleteCutoff {
+		if !s.segmentPinned(source.SegmentID) && s.getActiveLease(source.SegmentID) == nil && nextSource.CompactedAt <= segmentDeleteCutoff {
 			deleteSegments = append(deleteSegments, *source)
 		}
 		ops = append(ops, metaOp{Type: "put_segment", Segment: &nextSource})

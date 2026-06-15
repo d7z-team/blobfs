@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"strconv"
 	"strings"
@@ -435,5 +436,54 @@ func TestWalkTenantConcurrentWithDeleteTenant(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Fatalf("concurrent walk/delete-tenant: %v", err)
+	}
+}
+
+func TestLeaseAndCleanupSmoke(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	if err := store.MkdirAll("tenant-a/d1", 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "d1/file1", []byte("content1"))
+	putTestBytes(t, store, "tenant-a", "d1/file2", []byte("content2"))
+
+	ctx, cancel := context.WithTimeout(testContext(t), 30*time.Second)
+	defer cancel()
+
+	reader, lease, err := store.OpenObjectWithLease(ctx, "tenant-a", "d1/file1", nil)
+	if err != nil {
+		t.Fatalf("open with lease: %v", err)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(data) != "content1" {
+		t.Fatalf("expected content1, got %s", string(data))
+	}
+	lease.Release(ctx)
+	reader.Close()
+
+	counts, err := store.CountAll(ctx)
+	if err != nil {
+		t.Fatalf("countall: %v", err)
+	}
+	if counts["tenant-a"].TotalFiles != 2 {
+		t.Fatalf("expected 2 files before cleanup, got %d", counts["tenant-a"].TotalFiles)
+	}
+
+	err = store.DeleteObject(ctx, "tenant-a", "d1/file1")
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	counts, err = store.CountAll(ctx)
+	if err != nil {
+		t.Fatalf("countall after delete: %v", err)
+	}
+	if counts["tenant-a"].TotalFiles != 1 {
+		t.Fatalf("expected 1 file after delete, got %d", counts["tenant-a"].TotalFiles)
 	}
 }

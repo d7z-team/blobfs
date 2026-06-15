@@ -52,6 +52,9 @@ type Store struct {
 	handleMu sync.Mutex
 	handles  map[storeHandle]struct{}
 
+	leaseMu sync.Mutex
+	leases  map[string]*segmentLease
+
 	lifeMu  sync.Mutex
 	closing bool
 	bgRuns  bool
@@ -80,6 +83,33 @@ type PutResult struct {
 type RepairObjectOptions struct {
 	BaseGeneration uint64
 	Options        map[string]string
+}
+
+type LeaseOptions struct {
+	TTL           time.Duration
+	Holder        string
+	AutoRenew     bool
+	RenewInterval time.Duration
+}
+
+type CleanupOptions struct {
+	Workers          int
+	BatchSize        int
+	Filter           func(*CleanupInfo) bool
+	ErrorHandler     func(error, *CleanupInfo)
+	ProgressCallback func(processed, total int64, current *TenantCount) bool
+	DryRun           bool
+}
+
+type CleanupInfo struct {
+	TenantID  string
+	Path      string
+	Inode     inodeRecord
+	Depth     int
+	Size      int64
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	State     string
 }
 
 // ObjectInfo describes an active file and its user metadata.
@@ -167,6 +197,7 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		cfg:         cfg,
 		pins:        map[string]int{},
 		handles:     map[storeHandle]struct{}{},
+		leases:      map[string]*segmentLease{},
 		ctx:         storeCtx,
 		cancel:      cancel,
 		closed:      make(chan struct{}),
@@ -676,6 +707,70 @@ func (s *Store) OpenObject(ctx context.Context, tenantID, path string) (*ObjectR
 	}
 	defer s.endOp()
 	return s.openReader(tenantID, path, 0, -1)
+}
+
+func (s *Store) OpenObjectWithLease(ctx context.Context, tenantID, path string, opts *LeaseOptions) (*ObjectReader, *LeaseHandle, error) {
+	if err := s.beginOp(ctx); err != nil {
+		return nil, nil, err
+	}
+	defer s.endOp()
+	if err := validateTenantID(tenantID, s.cfg); err != nil {
+		return nil, nil, pathError("open", tenantID, err)
+	}
+	path, err := normalizePath(path, s.cfg)
+	if err != nil {
+		return nil, nil, pathError("open", path, err)
+	}
+
+	reader, err := s.openReader(tenantID, path, 0, -1)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	holder := "object-reader"
+	requestedTTL := time.Duration(0)
+	autoRenew := true
+	if opts != nil {
+		if opts.Holder != "" {
+			holder = opts.Holder
+		}
+		requestedTTL = opts.TTL
+		if !opts.AutoRenew {
+			autoRenew = false
+		}
+	}
+
+	var handles []*LeaseHandle
+	for _, segID := range reader.pinnedSegments {
+		h, err := s.grantLease(segID, holder, requestedTTL)
+		if err != nil {
+			for _, h := range handles {
+				_ = h.Release(ctx)
+			}
+			reader.Close()
+			return nil, nil, err
+		}
+		h.autoRenew = autoRenew
+		handles = append(handles, h)
+	}
+	reader.leaseHandles = handles
+	return reader, handles[0], nil
+}
+
+func (s *Store) ExtendObjectLease(ctx context.Context, reader *ObjectReader, ttl time.Duration) error {
+	if err := s.beginOp(ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
+	if reader == nil {
+		return errors.New("reader is nil")
+	}
+	for _, h := range reader.leaseHandles {
+		if err := h.Renew(ctx, ttl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // OpenRange opens a reader limited to [offset, offset+length). If length extends

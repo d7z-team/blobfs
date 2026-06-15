@@ -22,6 +22,10 @@ var (
 	ErrInvalidRange             = errors.New("range offset and length must be non-negative")
 	ErrReaderClosed             = errors.New("reader is closed")
 	ErrInvalidSeek              = errors.New("invalid seek")
+	ErrLeaseNotFound            = errors.New("blobfs: lease not found")
+	ErrLeaseExpired             = errors.New("blobfs: lease expired")
+	ErrTooManyLeases            = errors.New("blobfs: too many concurrent leases")
+	ErrInvalidLeaseTTL          = errors.New("blobfs: invalid lease TTL")
 )
 
 var (

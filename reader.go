@@ -1,9 +1,11 @@
 package blobfs
 
 import (
+	"context"
 	"io"
 	"sort"
 	"sync"
+	"time"
 )
 
 // ObjectReader reads an immutable snapshot of a file's manifest and chunks.
@@ -22,6 +24,7 @@ type ObjectReader struct {
 	fileHash       string
 	info           ObjectInfo
 	pinnedSegments []string
+	leaseHandles   []*LeaseHandle
 }
 
 type chunkSnapshot struct {
@@ -128,6 +131,19 @@ func (r *ObjectReader) Read(p []byte) (int, error) {
 	if r.offset >= r.limitEnd {
 		return 0, io.EOF
 	}
+
+	if len(r.leaseHandles) > 0 && r.leaseHandles[0] != nil {
+		if time.Until(r.leaseHandles[0].expires) < 30*time.Minute {
+			go func() {
+				for _, h := range r.leaseHandles {
+					if h.autoRenew {
+						_ = h.Renew(context.Background(), time.Hour)
+					}
+				}
+			}()
+		}
+	}
+
 	total := 0
 	for len(p) > 0 && r.offset < r.limitEnd {
 		if r.offset < r.bufStart || r.offset >= r.bufEnd {
@@ -186,8 +202,8 @@ func (r *ObjectReader) Seek(offset int64, whence int) (int64, error) {
 	return r.offset, nil
 }
 
-// Close releases segment pins held by the reader. It is safe to call Close more
-// than once.
+// Close releases segment pins held by the reader and releases any leases.
+// It is safe to call Close more than once.
 func (r *ObjectReader) Close() error {
 	r.mu.Lock()
 	if r.closed {
@@ -198,9 +214,14 @@ func (r *ObjectReader) Close() error {
 	pinned := r.pinnedSegments
 	r.pinnedSegments = nil
 	r.buf = nil
+	handles := r.leaseHandles
+	r.leaseHandles = nil
 	r.mu.Unlock()
 	for _, segmentID := range pinned {
 		r.store.unpinSegment(segmentID)
+	}
+	for _, h := range handles {
+		_ = h.Release(context.Background())
 	}
 	r.store.unregisterHandle(r)
 	return nil

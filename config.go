@@ -61,6 +61,9 @@ type GCConfig struct {
 	SegmentDeleteDelay     time.Duration
 	CompactGarbageRatio    float64
 	BackgroundGCInterval   time.Duration
+	DefaultLeaseTTL        time.Duration
+	MinSafetyWindow        time.Duration
+	MaxConcurrentLeases    int
 }
 
 // GCOptions overrides selected GC settings for a single run.
@@ -178,6 +181,9 @@ func DefaultConfig() Config {
 			CandidateConfirmCycles: 2,
 			SegmentDeleteDelay:     24 * time.Hour,
 			CompactGarbageRatio:    0.6,
+			DefaultLeaseTTL:        24 * time.Hour,
+			MinSafetyWindow:        1 * time.Hour,
+			MaxConcurrentLeases:    10000,
 		},
 	}
 }
