@@ -596,7 +596,7 @@ func saveSuperBlock(fs afero.Fs, metaDir string, txid uint64, logFile string) er
 	if txid%2 == 1 {
 		name = "SUPER1"
 	}
-	return writeFileSync(fs, filepath.Join(metaDir, name), payload, 0o600)
+	return writeFileAtomicSync(fs, filepath.Join(metaDir, name), payload, 0o600)
 }
 
 func nextMetaLogName(current string) string {
@@ -681,25 +681,6 @@ func compactMetadata(meta *metadata) {
 		}
 	}
 	trimRecentGCRuns(meta)
-}
-
-func writeFileSync(fs afero.Fs, path string, data []byte, perm os.FileMode) error {
-	if err := fs.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	file, err := fs.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
-	if err != nil {
-		return err
-	}
-	if _, err = file.Write(data); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err = file.Sync(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	return file.Close()
 }
 
 func writeFileAtomicSync(fs afero.Fs, path string, data []byte, perm os.FileMode) error {
