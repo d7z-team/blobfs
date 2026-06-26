@@ -141,6 +141,8 @@ const (
 	IssueSegmentWithoutChunks IssueKind = "segment_without_chunks"
 	// IssueMetadataLogTornTail is a crash-torn metadata log tail ignored during replay.
 	IssueMetadataLogTornTail IssueKind = "metadata_log_torn_tail"
+	// IssueRefCountWarning is a refcount inconsistency warning.
+	IssueRefCountWarning IssueKind = "refcount_warning"
 )
 
 // IssueSeverity is the severity of a diagnostic issue.
@@ -170,12 +172,13 @@ type Issue struct {
 type RepairOptions struct {
 	DryRun bool
 	// Apply must be true to execute actions. Without Apply, Repair only returns a dry-run plan.
-	Apply           bool
-	CleanStaging    bool
-	CleanOrphans    bool
-	ResetCompacting bool
-	DegradeMissing  bool
-	MaxActions      int
+	Apply                 bool
+	CleanStaging          bool
+	CleanOrphans          bool
+	ResetCompacting       bool
+	DegradeMissing        bool
+	ClearRefCountWarnings bool
+	MaxActions            int
 }
 
 // RepairReport lists planned or applied repair actions.
@@ -197,6 +200,8 @@ const (
 	RepairResetCompacting RepairActionType = "reset_compacting"
 	// RepairDegradeMissing marks missing data and degrades affected objects.
 	RepairDegradeMissing RepairActionType = "degrade_missing"
+	// RepairClearRefCountWarnings clears recorded refcount warnings.
+	RepairClearRefCountWarnings RepairActionType = "clear_refcount_warnings"
 )
 
 // RepairAction is one planned or applied repair operation.
@@ -315,6 +320,8 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		HealthCheck{Name: "no_missing_segments", OK: !hasMissingSegments, Message: healthMessage(!hasMissingSegments, "no missing segments", "missing segments exist")},
 		HealthCheck{Name: "no_compacting_segments", OK: !hasCompactingSegments, Message: healthMessage(!hasCompactingSegments, "no compacting segments", "compacting segments exist")},
 	)
+	hasRefCountWarnings := s.refCountWarningCount() > 0
+	report.Checks = append(report.Checks, HealthCheck{Name: "refcount_integrity", OK: !hasRefCountWarnings, Message: healthMessage(!hasRefCountWarnings, "refcounts are consistent", "refcount inconsistencies detected")})
 	report.DegradedObjects = degradedObjects
 	for tenantID := range degradedTenants {
 		report.AffectedTenants = append(report.AffectedTenants, tenantID)
@@ -331,7 +338,7 @@ func (s *Store) Health(ctx context.Context) (*HealthReport, error) {
 		report.Writable = false
 		return report, nil
 	}
-	if degradedObjects > 0 || hasMissingChunks || hasMissingSegments || !checkpointOK || !backgroundOK || hasCompactingSegments || len(replayWarnings) > 0 {
+	if degradedObjects > 0 || hasMissingChunks || hasMissingSegments || !checkpointOK || !backgroundOK || hasCompactingSegments || len(replayWarnings) > 0 || hasRefCountWarnings {
 		report.State = HealthDegraded
 	}
 	return report, nil
@@ -449,6 +456,16 @@ func (s *Store) Diagnose(ctx context.Context, opts DiagnoseOptions) (*DiagnoseRe
 			Repairable: false,
 		})
 	}
+	s.diagMu.Lock()
+	for _, msg := range s.refCountWarnings {
+		addIssue(Issue{
+			Kind:       IssueRefCountWarning,
+			Severity:   SeverityError,
+			Message:    msg,
+			Repairable: true,
+		})
+	}
+	s.diagMu.Unlock()
 	referencedPaths := s.referencedSegmentPathsLocked()
 	chunksBySegment := map[string]int{}
 	segments := make([]segmentRecord, 0, len(s.meta.Segments))
@@ -611,6 +628,16 @@ func (s *Store) Repair(ctx context.Context, opts RepairOptions) (*RepairReport, 
 	if opts.DegradeMissing {
 		if err := s.repairMissingSegments(ctx, dryRun, addAction); err != nil {
 			return report, err
+		}
+	}
+	if opts.ClearRefCountWarnings {
+		if !addAction(RepairAction{Type: RepairClearRefCountWarnings, Target: "", Message: "clear refcount warnings"}) {
+			return report, nil
+		}
+		if !dryRun {
+			if err := s.ClearRefCountWarnings(ctx); err != nil {
+				return report, err
+			}
 		}
 	}
 	return report, nil

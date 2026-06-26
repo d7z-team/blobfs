@@ -1169,3 +1169,113 @@ func TestDeleteTenantOnlyAffectsTargetTenant(t *testing.T) {
 		t.Fatalf("health state = %s, want OK", health.State)
 	}
 }
+
+func TestSegmentSafeToDeleteBlocksPinnedOrLeasedSegments(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.MkdirAll("tenant-a/safety", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+	putTestBytes(t, store, "tenant-a", "safety/blob", []byte("safe delete test content"))
+	_, firstSegID := firstChunkPayload(t, store, "tenant-a", "safety/blob")
+	if !store.segmentSafeToDelete(firstSegID) {
+		t.Fatal("unpinned segment should be safe to delete")
+	}
+
+	reader, err := store.OpenObject(testContext(t), "tenant-a", "safety/blob")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if store.segmentSafeToDelete(firstSegID) {
+		t.Fatal("pinned segment should not be safe to delete")
+	}
+	reader.Close()
+	if !store.segmentSafeToDelete(firstSegID) {
+		t.Fatal("unpinned segment should be safe to delete after close")
+	}
+
+	reader2, lease, err := store.OpenObjectWithLease(testContext(t), "tenant-a", "safety/blob", &LeaseOptions{Holder: "test", TTL: time.Hour, AutoRenew: false})
+	if err != nil {
+		t.Fatalf("open with lease: %v", err)
+	}
+	defer reader2.Close()
+	defer lease.Release(testContext(t))
+	if store.segmentSafeToDelete(firstSegID) {
+		t.Fatal("leased segment should not be safe to delete")
+	}
+}
+
+func TestRefCountWarningReportedByHealth(t *testing.T) {
+	store := openTestStore(t)
+
+	report, err := store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if !hasHealthCheck(report, "refcount_integrity", true) {
+		t.Fatal("refcount_integrity should be OK initially")
+	}
+
+	store.recordRefCountWarning("test warning: chunk abc refcount went negative (delta=-1, was=0)")
+
+	report, err = store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if hasHealthCheck(report, "refcount_integrity", true) {
+		t.Fatal("refcount_integrity should NOT be OK after warning recorded")
+	}
+	if report.State != HealthDegraded {
+		t.Fatalf("health state = %s, want DEGRADED", report.State)
+	}
+	if store.refCountWarningCount() != 1 {
+		t.Fatalf("refCountWarningCount = %d, want 1", store.refCountWarningCount())
+	}
+
+	warnings, err := store.GetRefCountWarnings(testContext(t))
+	if err != nil {
+		t.Fatalf("get warnings: %v", err)
+	}
+	if len(warnings) != 1 || warnings[0] != "test warning: chunk abc refcount went negative (delta=-1, was=0)" {
+		t.Fatalf("got warnings %v, want 1 specific warning", warnings)
+	}
+
+	report2, err := store.Diagnose(testContext(t), DiagnoseOptions{})
+	if err != nil {
+		t.Fatalf("diagnose: %v", err)
+	}
+	found := false
+	for _, issue := range report2.Issues {
+		if issue.Kind == IssueRefCountWarning {
+			found = true
+			if !issue.Repairable {
+				t.Fatal("refcount warning issue should be repairable")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("refcount warning not reported by Diagnose")
+	}
+
+	if err := store.ClearRefCountWarnings(testContext(t)); err != nil {
+		t.Fatalf("clear warnings: %v", err)
+	}
+	if store.refCountWarningCount() != 0 {
+		t.Fatalf("refCountWarningCount = %d after clear, want 0", store.refCountWarningCount())
+	}
+
+	report, err = store.Health(testContext(t))
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if !hasHealthCheck(report, "refcount_integrity", true) {
+		t.Fatal("refcount_integrity should be OK after clear")
+	}
+
+	for i := 0; i < maxRefCountWarnings+10; i++ {
+		store.recordRefCountWarning("warning " + strconv.Itoa(i))
+	}
+	if store.refCountWarningCount() != maxRefCountWarnings {
+		t.Fatalf("refCountWarningCount = %d after overflow, want %d", store.refCountWarningCount(), maxRefCountWarnings)
+	}
+}

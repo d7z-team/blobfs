@@ -1,5 +1,7 @@
 package blobfs
 
+import "fmt"
+
 func addManifestRefDelta(manifest *manifestRecord, delta int, manifestDeltas, chunkDeltas map[string]int) {
 	if manifest == nil || delta == 0 {
 		return
@@ -15,7 +17,7 @@ func addManifestRefDelta(manifest *manifestRecord, delta int, manifestDeltas, ch
 	}
 }
 
-func appendRefDeltaOpsLocked(meta *metadata, ops *[]metaOp, manifestRecords map[string]*manifestRecord, manifestDeltas, chunkDeltas map[string]int, now int64) {
+func appendRefDeltaOpsLocked(meta *metadata, ops *[]metaOp, manifestRecords map[string]*manifestRecord, manifestDeltas, chunkDeltas map[string]int, now int64, refCountWarnings *[]string) {
 	for manifestID, delta := range manifestDeltas {
 		manifest := manifestRecords[manifestID]
 		if manifest == nil {
@@ -59,6 +61,11 @@ func appendRefDeltaOpsLocked(meta *metadata, ops *[]metaOp, manifestRecords map[
 		next := *chunk
 		next.RefCount += delta
 		if next.RefCount < 0 {
+			if refCountWarnings != nil {
+				*refCountWarnings = append(*refCountWarnings, fmt.Sprintf(
+					"chunk %s refcount went negative (delta=%d, was=%d)",
+					chunkID, delta, chunk.RefCount))
+			}
 			next.RefCount = 0
 		}
 		if next.RefCount > 0 {
@@ -74,7 +81,7 @@ func appendRefDeltaOpsLocked(meta *metadata, ops *[]metaOp, manifestRecords map[
 	}
 }
 
-func addDeletedManifestOpsLocked(meta *metadata, manifestID string, ops *[]metaOp, now int64) {
+func addDeletedManifestOpsLocked(meta *metadata, manifestID string, ops *[]metaOp, now int64, refCountWarnings *[]string) {
 	manifest := meta.Manifests[manifestID]
 	if manifest == nil {
 		return
@@ -82,5 +89,5 @@ func addDeletedManifestOpsLocked(meta *metadata, manifestID string, ops *[]metaO
 	manifestDeltas := map[string]int{}
 	chunkDeltas := map[string]int{}
 	addManifestRefDelta(manifest, -1, manifestDeltas, chunkDeltas)
-	appendRefDeltaOpsLocked(meta, ops, map[string]*manifestRecord{manifestID: manifest}, manifestDeltas, chunkDeltas, now)
+	appendRefDeltaOpsLocked(meta, ops, map[string]*manifestRecord{manifestID: manifest}, manifestDeltas, chunkDeltas, now, refCountWarnings)
 }

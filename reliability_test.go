@@ -371,6 +371,84 @@ func TestMaxOpenWriteSessionsIsEnforced(t *testing.T) {
 	}
 }
 
+func TestGarbageCandidateChunkReusedOnReupload(t *testing.T) {
+	cfg := testConfig()
+	cfg.GC.CandidateConfirmCycles = 2
+	cfg.GC.SegmentDeleteDelay = -1
+	store, err := Open(t.TempDir(), cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll("tenant-a/reuse", 0o755); err != nil {
+		t.Fatalf("mkdirall: %v", err)
+	}
+
+	data := []byte("dedup")
+	first := putTestBytes(t, store, "tenant-a", "reuse/old", data)
+
+	store.metaMu.RLock()
+	oldManifest := store.meta.Manifests[first.ManifestID]
+	if oldManifest == nil || len(oldManifest.Chunks) != 1 {
+		store.metaMu.RUnlock()
+		t.Fatalf("expected single chunk manifest")
+	}
+	oldChunkID := oldManifest.Chunks[0].ChunkID
+	oldChunk := store.meta.Chunks[oldChunkID]
+	if oldChunk == nil {
+		store.metaMu.RUnlock()
+		t.Fatal("old chunk missing")
+	}
+	oldSegmentID := oldChunk.SegmentID
+	store.metaMu.RUnlock()
+
+	if err := store.DeleteObject(testContext(t), "tenant-a", "reuse/old"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	result, err := store.RunGC(testContext(t), GCOptions{Compact: false})
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+
+	store.metaMu.RLock()
+	candidate := store.meta.Chunks[oldChunkID]
+	store.metaMu.RUnlock()
+	if candidate == nil {
+		t.Fatal("chunk was deleted, expected GARBAGE_CANDIDATE")
+	}
+	if candidate.State != chunkStateGarbageCandidate {
+		t.Fatalf("chunk state = %s, want GARBAGE_CANDIDATE", candidate.State)
+	}
+	if result.CandidatesMarked < 1 {
+		t.Fatalf("no candidates marked: %+v", result)
+	}
+
+	second := putTestBytes(t, store, "tenant-a", "reuse/new", data)
+	if first.ManifestID != second.ManifestID {
+		t.Fatalf("manifest changed: %s != %s", first.ManifestID, second.ManifestID)
+	}
+
+	store.metaMu.RLock()
+	reusedChunk := store.meta.Chunks[oldChunkID]
+	store.metaMu.RUnlock()
+	if reusedChunk == nil {
+		t.Fatal("reused chunk missing from metadata")
+	}
+	if reusedChunk.SegmentID != oldSegmentID {
+		t.Fatalf("chunk reused different segment: %s != %s", reusedChunk.SegmentID, oldSegmentID)
+	}
+	if reusedChunk.State != chunkStateActive {
+		t.Fatalf("chunk state = %s after reuse, want ACTIVE", reusedChunk.State)
+	}
+	if reusedChunk.RefCount != 1 {
+		t.Fatalf("chunk refcount = %d, want 1", reusedChunk.RefCount)
+	}
+	if reusedChunk.GarbageSeenCount != 0 {
+		t.Fatalf("chunk GarbageSeenCount = %d, want 0 after reuse", reusedChunk.GarbageSeenCount)
+	}
+}
+
 func TestWriteSessionLimitReleasedAfterOpenFailure(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxOpenWriteSessions = 1

@@ -1,5 +1,7 @@
 package blobfs
 
+// Lock ordering: see gc.go for the canonical ordering declaration.
+
 import (
 	"context"
 	"fmt"

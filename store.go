@@ -55,6 +55,9 @@ type Store struct {
 	leaseMu sync.Mutex
 	leases  map[string]*segmentLease
 
+	diagMu           sync.Mutex
+	refCountWarnings []string
+
 	lifeMu  sync.Mutex
 	closing bool
 	bgRuns  bool
@@ -598,7 +601,7 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 		chunk := prepared.chunks[chunkID]
 		current := s.meta.Chunks[chunkID]
 		segment := s.meta.Segments[chunk.SegmentID]
-		if current == nil || current.State != chunkStateActive ||
+		if current == nil || !chunkReadableState(current.State) ||
 			segment == nil || segment.State == segmentStateDeleted || segment.State == segmentStateMissing {
 			return nil, errChunkNotReadable
 		}
@@ -647,7 +650,7 @@ func (s *Store) commitPreparedObject(ctx context.Context, prepared *preparedObje
 			addManifestRefDelta(oldManifest, -1, manifestDeltas, chunkDeltas)
 		}
 	}
-	appendRefDeltaOpsLocked(s.meta, &ops, manifestRecords, manifestDeltas, chunkDeltas, now)
+	appendRefDeltaOpsLocked(s.meta, &ops, manifestRecords, manifestDeltas, chunkDeltas, now, &s.refCountWarnings)
 	var inode *inodeRecord
 	if existing == nil {
 		inode = &inodeRecord{
@@ -885,7 +888,7 @@ func (s *Store) DeleteObject(ctx context.Context, tenantID, path string) error {
 		{Type: "put_inode", Inode: next},
 		{Type: "delete_dirent", ParentID: parentID, Name: name},
 	}
-	addDeletedManifestOpsLocked(s.meta, inode.ManifestID, &ops, now)
+	addDeletedManifestOpsLocked(s.meta, inode.ManifestID, &ops, now, &s.refCountWarnings)
 	return s.commitMetaLocked(ops)
 }
 
@@ -1041,6 +1044,9 @@ func (s *Store) checkpointMetaLocked() error {
 	s.metaLogName = newName
 	s.commitsSinceCheckpoint = 0
 	s.lastCheckpointErr = nil
+	s.diagMu.Lock()
+	s.refCountWarnings = s.refCountWarnings[:0]
+	s.diagMu.Unlock()
 	var cleanupErr error
 	if oldLog != nil {
 		cleanupErr = errors.Join(cleanupErr, oldLog.Close())
@@ -1156,7 +1162,10 @@ func (s *Store) pinChunkSnapshot(chunkID string) *chunkRecord {
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
 	chunk := s.meta.Chunks[chunkID]
-	if chunk == nil || chunk.RefCount <= 0 || chunk.State != chunkStateActive {
+	if chunk == nil || (chunk.RefCount <= 0 && chunk.State != chunkStateGarbageCandidate) {
+		return nil
+	}
+	if !chunkReadableState(chunk.State) {
 		return nil
 	}
 	segment := s.meta.Segments[chunk.SegmentID]
@@ -1166,6 +1175,10 @@ func (s *Store) pinChunkSnapshot(chunkID string) *chunkRecord {
 	s.pinSegment(chunk.SegmentID)
 	next := *chunk
 	return &next
+}
+
+func chunkReadableState(state string) bool {
+	return state == chunkStateActive || state == chunkStateGarbageCandidate
 }
 
 func cloneInode(inode *inodeRecord) *inodeRecord {
@@ -1304,4 +1317,44 @@ func sortedNames(entries map[string]uint64) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func (s *Store) recordRefCountWarning(msg string) {
+	s.diagMu.Lock()
+	if len(s.refCountWarnings) >= maxRefCountWarnings {
+		s.refCountWarnings = s.refCountWarnings[1:]
+	}
+	s.refCountWarnings = append(s.refCountWarnings, msg)
+	s.diagMu.Unlock()
+}
+
+func (s *Store) refCountWarningCount() int {
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+	return len(s.refCountWarnings)
+}
+
+// GetRefCountWarnings returns a snapshot of all recorded refcount warnings.
+func (s *Store) GetRefCountWarnings(ctx context.Context) ([]string, error) {
+	if err := s.beginOp(ctx); err != nil {
+		return nil, err
+	}
+	defer s.endOp()
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+	warnings := make([]string, len(s.refCountWarnings))
+	copy(warnings, s.refCountWarnings)
+	return warnings, nil
+}
+
+// ClearRefCountWarnings clears all recorded refcount warnings.
+func (s *Store) ClearRefCountWarnings(ctx context.Context) error {
+	if err := s.beginOp(ctx); err != nil {
+		return err
+	}
+	defer s.endOp()
+	s.diagMu.Lock()
+	s.refCountWarnings = s.refCountWarnings[:0]
+	s.diagMu.Unlock()
+	return nil
 }

@@ -29,6 +29,12 @@ type segmentGCStats struct {
 	DeadAt        int64
 }
 
+// Lock ordering conventions:
+//   metaMu → leaseMu → pinMu
+//
+// metaMu must be acquired before leaseMu or pinMu. leaseMu and pinMu may be
+// acquired independently (without metaMu). Do not hold leaseMu when acquiring metaMu.
+
 // RunGC marks unreferenced chunks, optionally compacts fragmented segments, and
 // deletes fully dead segments without holding metadata locks during filesystem IO.
 func (s *Store) RunGC(ctx context.Context, opts GCOptions) (*GCResult, error) {
@@ -429,12 +435,31 @@ func (s *Store) removeSegmentFiles(ctx context.Context, segments []segmentRecord
 		if err := contextError(ctx); err != nil {
 			return deleted, err
 		}
+		if !s.segmentSafeToDelete(seg.SegmentID) {
+			continue
+		}
 		if err := s.fs.Remove(s.segmentPath(&seg)); err != nil && !os.IsNotExist(err) {
 			return deleted, err
 		}
 		deleted = append(deleted, seg)
 	}
 	return deleted, nil
+}
+
+func (s *Store) segmentSafeToDelete(segmentID string) bool {
+	s.metaMu.RLock()
+	seg := s.meta.Segments[segmentID]
+	s.metaMu.RUnlock()
+	if seg == nil || seg.State == segmentStateDeleted {
+		return false
+	}
+	if s.segmentPinned(segmentID) {
+		return false
+	}
+	if s.getActiveLease(segmentID) != nil {
+		return false
+	}
+	return true
 }
 
 func (s *Store) collectUnreachableInodesLocked(now int64, ops *[]metaOp) {
@@ -467,5 +492,5 @@ func (s *Store) collectUnreachableInodesLocked(now int64, ops *[]metaOp) {
 			}
 		}
 	}
-	appendRefDeltaOpsLocked(s.meta, ops, manifestRecords, manifestDeltas, chunkDeltas, now)
+	appendRefDeltaOpsLocked(s.meta, ops, manifestRecords, manifestDeltas, chunkDeltas, now, nil)
 }

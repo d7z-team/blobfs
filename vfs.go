@@ -327,7 +327,7 @@ func (s *Store) Remove(name string) error {
 	next.Generation++
 	ops := []metaOp{{Type: "put_inode", Inode: next}, {Type: "delete_dirent", ParentID: parentID, Name: base}}
 	if inode.Kind == fileKindFile {
-		addDeletedManifestOpsLocked(s.meta, inode.ManifestID, &ops, now)
+		addDeletedManifestOpsLocked(s.meta, inode.ManifestID, &ops, now, nil)
 	}
 	return s.commitMetaLocked(ops)
 }
@@ -372,7 +372,7 @@ func (s *Store) RemoveAll(name string) error {
 	next.Generation++
 	ops = append(ops, metaOp{Type: "put_inode", Inode: next})
 	if inode.Kind == fileKindFile {
-		addDeletedManifestOpsLocked(s.meta, inode.ManifestID, &ops, now)
+		addDeletedManifestOpsLocked(s.meta, inode.ManifestID, &ops, now, nil)
 	}
 	return s.commitMetaLocked(ops)
 }
@@ -439,7 +439,7 @@ func (s *Store) Rename(oldname, newname string) error {
 		tombstone.Generation++
 		ops = append(ops, metaOp{Type: "put_inode", Inode: tombstone})
 		if target.Kind == fileKindFile {
-			addDeletedManifestOpsLocked(s.meta, target.ManifestID, &ops, now)
+			addDeletedManifestOpsLocked(s.meta, target.ManifestID, &ops, now, nil)
 		}
 	}
 	next := cloneInode(source)

@@ -49,6 +49,7 @@ const (
 	metaCheckpointInterval = 128
 	metaFrameMagic         = uint32(0x324d4642)
 	maxRecentGCRuns        = 1024
+	maxRefCountWarnings    = 1024
 )
 
 type inodeRecord struct {
