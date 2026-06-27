@@ -827,7 +827,7 @@ func TestCheckpointCompactsMetadataLogAndRecovers(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "meta", metaCheckpointFile)); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "meta", metaCheckpointDir, "manifest.json")); err != nil {
 		t.Fatalf("checkpoint missing: %v", err)
 	}
 	super, err := loadMetaSuperBlock(afero.NewOsFs(), filepath.Join(dir, "meta"))

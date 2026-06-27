@@ -27,3 +27,31 @@
 - 优先覆盖热点路径、边界参数、错误路径和故障恢复场景。
 - 对热点代码覆盖测试，覆盖边界测试，增加冒烟测试，增加混沌测试
 - 完成代码修改后至少运行 `make lint test`。
+
+## 元数据版本迁移架构
+
+### 原则
+
+1. **旧版本隔离**：每个历史版本的结构体和迁移逻辑放在独立的 `vN_store_meta.go` 文件，冻结不随主代码演化。
+2. **链式升级**：`v1 → v2 → v3 → ...` 每步一个迁移函数，按序执行。
+3. **幂等迁移**：所有迁移函数支持崩溃重试，检测已迁移部分并跳过。
+4. **版本真源**：`SUPER0/SUPER1` 的 `format_version` 字段是唯一的版本真相来源。
+5. **记录类型兼容**：`inodeRecord` 等记录类型新增字段必须使用 `omitempty` 标签。若需破坏性变更，在对应 `vN_store_meta.go` 中冻结旧类型拷贝。
+
+### 文件布局
+
+```
+metadata.go          ← 当前版本核心逻辑
+v1_store_meta.go     ← v1 结构体 + v1→v2 迁移函数（冻结）
+v1_store_meta_test.go← v1 迁移专用测试
+```
+
+### 添加新版本 (v3 为例)
+
+1. 新建 `v2_store_meta.go`，冻结 v2 `metadata` 结构体
+2. 实现 `migrateV2ToV3(fs afero.Fs, metaDir string) error`
+3. 在 `migrationChain` 注册：`2: migrateV2ToV3`
+4. 更新 `metaFormatVersion` 常量
+5. 若 `inodeRecord` 等记录类型需要破坏性变更，在此文件中冻结旧类型拷贝
+6. 新增 `v2_store_meta_test.go` 覆盖迁移测试
+7. 放宽 `decodeMetaSuperBlock` 版本上限（自动随 `metaFormatVersion` 提升）

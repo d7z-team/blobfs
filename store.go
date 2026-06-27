@@ -28,6 +28,7 @@ type Store struct {
 	metaLog                afero.File
 	metaLogName            string
 	commitsSinceCheckpoint int
+	lastCheckpointTime     time.Time
 	lastCheckpointErr      error
 	recoveryWarnings       []metadataReplayWarning
 
@@ -138,6 +139,7 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		return nil, err
 	}
 	store.metaLog = metaLog
+	store.lastCheckpointTime = time.Now()
 	if err := saveSuperBlock(store.fs, store.metaDir, store.meta.TxID, store.metaLogName); err != nil {
 		_ = store.Close()
 		return nil, err

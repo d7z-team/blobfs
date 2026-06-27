@@ -598,10 +598,16 @@ func TestSuperBlockBothCorrupted(t *testing.T) {
 	// Write two corrupt super blocks.
 	afero.WriteFile(afero.NewOsFs(), filepath.Join(metaDir, "SUPER0"), []byte("corrupt0"), 0o644)
 	afero.WriteFile(afero.NewOsFs(), filepath.Join(metaDir, "SUPER1"), []byte("corrupt1"), 0o644)
-	// Create a valid checkpoint.
+	// Create a valid checkpoint in the new directory-based format.
 	meta := newMetadata()
-	data, _ := json.Marshal(meta)
-	afero.WriteFile(afero.NewOsFs(), filepath.Join(metaDir, metaCheckpointFile), data, 0o644)
+	chkpointDir := filepath.Join(metaDir, metaCheckpointDir)
+	if err := afero.NewOsFs().MkdirAll(chkpointDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := checkpointManifest{Version: 2, TxID: meta.TxID, Shards: map[string]checkpointShard{}}
+	manifestData, _ := json.Marshal(manifest)
+	afero.WriteFile(afero.NewOsFs(), filepath.Join(chkpointDir, "manifest.json"), manifestData, 0o644)
+	afero.WriteFile(afero.NewOsFs(), filepath.Join(chkpointDir, "meta.json"), []byte(`{"version":2,"next_inode_id":1,"next_segment_seq":1,"next_gc_epoch":1}`), 0o644)
 	// Create a valid log.
 	afero.WriteFile(afero.NewOsFs(), filepath.Join(metaDir, metaLogFile+".lock"), []byte{}, 0o600)
 	logPath := filepath.Join(metaDir, "txlog", metaLogFile)

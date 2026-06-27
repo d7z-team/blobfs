@@ -1,6 +1,7 @@
 package blobfs
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -46,8 +47,11 @@ const (
 const (
 	metaFormatVersion      = 2
 	metaLogFile            = "000001.log"
-	metaCheckpointFile     = "checkpoint.json"
 	metaCheckpointInterval = 128
+	metaCheckpointTimeMin  = 30e9 // 30 seconds in nanoseconds
+	metaCheckpointShards   = 256
+	metaCheckpointDir      = "checkpoint"
+	metaCheckpointNextDir  = "checkpoint_next"
 	metaFrameMagic         = uint32(0x324d4642)
 	maxRecentGCRuns        = 1024
 	maxRefCountWarnings    = 1024
@@ -158,18 +162,43 @@ type gcMetadata struct {
 }
 
 type metadata struct {
-	Version        int                          `json:"version"`
-	TxID           uint64                       `json:"txid"`
-	NextInodeID    uint64                       `json:"next_inode_id"`
-	NextSegmentSeq int64                        `json:"next_segment_seq"`
-	NextGCEpoch    int64                        `json:"next_gc_epoch"`
-	Tenants        map[string]uint64            `json:"tenants"`
-	Inodes         map[uint64]*inodeRecord      `json:"inodes"`
-	DirEntries     map[uint64]map[string]uint64 `json:"dir_entries"`
-	Manifests      map[string]*manifestRecord   `json:"manifests"`
-	Chunks         map[string]*chunkRecord      `json:"chunks"`
-	Segments       map[string]*segmentRecord    `json:"segments"`
-	GC             gcMetadata                   `json:"gc,omitempty"`
+	Version        int                          `json:"-"`
+	TxID           uint64                       `json:"-"`
+	NextInodeID    uint64                       `json:"-"`
+	NextSegmentSeq int64                        `json:"-"`
+	NextGCEpoch    int64                        `json:"-"`
+	Tenants        map[string]uint64            `json:"-"`
+	Inodes         map[uint64]*inodeRecord      `json:"-"`
+	DirEntries     map[uint64]map[string]uint64 `json:"-"`
+	Manifests      map[string]*manifestRecord   `json:"-"`
+	Chunks         map[string]*chunkRecord      `json:"-"`
+	Segments       map[string]*segmentRecord    `json:"-"`
+	GC             gcMetadata                   `json:"-"`
+}
+
+type checkpointManifest struct {
+	Version int                        `json:"version"`
+	TxID    uint64                     `json:"txid"`
+	Shards  map[string]checkpointShard `json:"shards"`
+}
+
+type checkpointShard struct {
+	Count int               `json:"count"`
+	Files map[string]string `json:"files"`
+}
+
+type checkpointMeta struct {
+	Version        int        `json:"version"`
+	NextInodeID    uint64     `json:"next_inode_id"`
+	NextSegmentSeq int64      `json:"next_segment_seq"`
+	NextGCEpoch    int64      `json:"next_gc_epoch"`
+	GC             gcMetadata `json:"gc"`
+}
+
+type dirEntryLine struct {
+	P uint64 `json:"p"`
+	N string `json:"n"`
+	C uint64 `json:"c"`
 }
 
 type metaTx struct {
@@ -232,7 +261,10 @@ func loadMetadata(fs afero.Fs, metaDir string) (*metadata, string, metadataLoadR
 	if err := fs.MkdirAll(metaTxLogDir(metaDir), 0o755); err != nil {
 		return nil, "", metadataLoadReport{}, err
 	}
-	if err := loadMetaCheckpoint(fs, filepath.Join(metaDir, metaCheckpointFile), meta); err != nil {
+	if err := migrateIfNeeded(fs, metaDir); err != nil {
+		return nil, "", metadataLoadReport{}, err
+	}
+	if err := loadCheckpoint(fs, metaDir, meta); err != nil {
 		return nil, "", metadataLoadReport{}, err
 	}
 	super, err := loadMetaSuperBlock(fs, metaDir)
@@ -250,21 +282,6 @@ func loadMetadata(fs afero.Fs, metaDir string) (*metadata, string, metadataLoadR
 	recoverInProgressMetadata(meta)
 	recomputeMetaCounters(meta)
 	return meta, logFile, report, nil
-}
-
-func loadMetaCheckpoint(fs afero.Fs, path string, meta *metadata) error {
-	data, err := afero.ReadFile(fs, path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(data, meta); err != nil {
-		return err
-	}
-	ensureMetaMaps(meta)
-	return nil
 }
 
 func replayMetaLog(fs afero.Fs, path string, meta *metadata) (metadataLoadReport, error) {
@@ -365,6 +382,22 @@ func applyMetaTx(meta *metadata, tx metaTx) {
 	}
 }
 
+func strShardIdx(s string) int {
+	var h uint64
+	for _, b := range []byte(s) {
+		h = h*31 + uint64(b)
+	}
+	return int(h % 256)
+}
+
+func dirEntryShardIdx(parentID uint64, name string) int {
+	h := parentID
+	for _, b := range []byte(name) {
+		h = h*31 + uint64(b)
+	}
+	return int(h % 256)
+}
+
 func applyMetaOp(meta *metadata, op metaOp) {
 	switch op.Type {
 	case "put_tenant":
@@ -428,6 +461,437 @@ func applyMetaOp(meta *metadata, op metaOp) {
 			meta.GC.TotalRuns++
 			meta.GC.Recent = append(meta.GC.Recent, *op.GCRun)
 			trimRecentGCRuns(meta)
+		}
+	}
+}
+
+// --- checkpoint save/load -----------------------------------------------------------
+
+func saveCheckpoint(fs afero.Fs, metaDir string, meta *metadata) error {
+	nextDir := filepath.Join(metaDir, metaCheckpointNextDir)
+	_ = fs.RemoveAll(nextDir)
+	if err := fs.MkdirAll(nextDir, 0o755); err != nil {
+		return err
+	}
+	var cleanupOnErr bool
+	defer func() {
+		if cleanupOnErr {
+			_ = fs.RemoveAll(nextDir)
+		}
+	}()
+
+	manifest := checkpointManifest{Version: 2, TxID: meta.TxID, Shards: map[string]checkpointShard{}}
+
+	// meta.json — counters + GC
+	cm := checkpointMeta{
+		Version:        meta.Version,
+		NextInodeID:    meta.NextInodeID,
+		NextSegmentSeq: meta.NextSegmentSeq,
+		NextGCEpoch:    meta.NextGCEpoch,
+		GC:             meta.GC,
+	}
+	if err := writeJSONFile(fs, filepath.Join(nextDir, "meta.json"), cm); err != nil {
+		cleanupOnErr = true
+		return err
+	}
+
+	// tenants.jsonl — always single file (small)
+	shardFiles, count, err := saveMapAsJSONLines(fs, nextDir, 1, func(idx int) string { return "tenants.jsonl" },
+		func(yield func([]byte) bool) {
+			for tid, rootID := range meta.Tenants {
+				b, _ := json.Marshal([2]any{tid, rootID})
+				if !yield(b) {
+					return
+				}
+			}
+		})
+	if err != nil {
+		cleanupOnErr = true
+		return err
+	}
+	manifest.Shards["tenants"] = checkpointShard{Count: count, Files: shardFiles}
+
+	// inodes — 256 shards
+	shardFiles, count, err = saveShardedMap(fs, nextDir, "inodes", meta.Inodes, metaCheckpointShards,
+		func(key uint64) int { return int(key % 256) },
+		func(key uint64, val *inodeRecord) ([]byte, error) { return json.Marshal(val) },
+	)
+	if err != nil {
+		cleanupOnErr = true
+		return err
+	}
+	manifest.Shards["inodes"] = checkpointShard{Count: count, Files: shardFiles}
+
+	// dir_entries — 256 shards (flattened)
+	shardFiles, count, err = saveDirEntriesAsJSONLines(fs, nextDir, meta.DirEntries, metaCheckpointShards)
+	if err != nil {
+		cleanupOnErr = true
+		return err
+	}
+	manifest.Shards["dir_entries"] = checkpointShard{Count: count, Files: shardFiles}
+
+	// manifests — 256 shards
+	shardFiles, count, err = saveShardedMap(fs, nextDir, "manifests", meta.Manifests, metaCheckpointShards,
+		strShardIdx,
+		func(key string, val *manifestRecord) ([]byte, error) { return json.Marshal(val) },
+	)
+	if err != nil {
+		cleanupOnErr = true
+		return err
+	}
+	manifest.Shards["manifests"] = checkpointShard{Count: count, Files: shardFiles}
+
+	// chunks — 256 shards
+	shardFiles, count, err = saveShardedMap(fs, nextDir, "chunks", meta.Chunks, metaCheckpointShards,
+		strShardIdx,
+		func(key string, val *chunkRecord) ([]byte, error) { return json.Marshal(val) },
+	)
+	if err != nil {
+		cleanupOnErr = true
+		return err
+	}
+	manifest.Shards["chunks"] = checkpointShard{Count: count, Files: shardFiles}
+
+	// segments — 256 shards
+	shardFiles, count, err = saveShardedMap(fs, nextDir, "segments", meta.Segments, metaCheckpointShards,
+		strShardIdx,
+		func(key string, val *segmentRecord) ([]byte, error) { return json.Marshal(val) },
+	)
+	if err != nil {
+		cleanupOnErr = true
+		return err
+	}
+	manifest.Shards["segments"] = checkpointShard{Count: count, Files: shardFiles}
+
+	// manifest.json — write LAST as atomic root
+	if err := writeJSONFile(fs, filepath.Join(nextDir, "manifest.json"), manifest); err != nil {
+		cleanupOnErr = true
+		return err
+	}
+
+	// fsync directory to persist all files
+	if err := syncDir(fs, nextDir); err != nil {
+		cleanupOnErr = true
+		return err
+	}
+
+	// atomic swap: remove old, rename new
+	chkpointDir := filepath.Join(metaDir, metaCheckpointDir)
+	_ = fs.RemoveAll(chkpointDir)
+	if err := fs.Rename(nextDir, chkpointDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func loadCheckpoint(fs afero.Fs, metaDir string, meta *metadata) error {
+	chkpointDir := filepath.Join(metaDir, metaCheckpointDir)
+	nextDir := filepath.Join(metaDir, metaCheckpointNextDir)
+
+	// Complete an interrupted swap: only if nextDir has a valid manifest.
+	if _, err := fs.Stat(filepath.Join(nextDir, "manifest.json")); err == nil {
+		_ = fs.RemoveAll(chkpointDir)
+		if err := fs.Rename(nextDir, chkpointDir); err != nil {
+			_ = fs.RemoveAll(nextDir)
+		}
+	} else {
+		// Stale partial nextDir — just clean it up.
+		_ = fs.RemoveAll(nextDir)
+	}
+
+	manifestPath := filepath.Join(chkpointDir, "manifest.json")
+	data, err := afero.ReadFile(fs, manifestPath)
+	if os.IsNotExist(err) {
+		return nil // no checkpoint, start empty
+	}
+	if err != nil {
+		return err
+	}
+	var manifest checkpointManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return err
+	}
+	meta.TxID = manifest.TxID
+
+	// meta.json
+	if err := readJSONFileInto(fs, filepath.Join(chkpointDir, "meta.json"), func(b []byte) error {
+		var cm checkpointMeta
+		if err := json.Unmarshal(b, &cm); err != nil {
+			return err
+		}
+		meta.Version = cm.Version
+		meta.NextInodeID = cm.NextInodeID
+		meta.NextSegmentSeq = cm.NextSegmentSeq
+		meta.NextGCEpoch = cm.NextGCEpoch
+		meta.GC = cm.GC
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// tenants
+	si := manifest.Shards["tenants"]
+	meta.Tenants = make(map[string]uint64, si.Count)
+	for _, file := range si.Files {
+		if err := readJSONLinesFile(fs, filepath.Join(chkpointDir, file), func(line []byte) error {
+			var pair [2]any
+			if err := json.Unmarshal(line, &pair); err != nil {
+				return err
+			}
+			tid, _ := pair[0].(string)
+			rid, _ := pair[1].(float64)
+			meta.Tenants[tid] = uint64(rid)
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	// inodes
+	si = manifest.Shards["inodes"]
+	meta.Inodes = make(map[uint64]*inodeRecord, si.Count)
+	for _, file := range si.Files {
+		if err := readJSONLinesFile(fs, filepath.Join(chkpointDir, file), func(line []byte) error {
+			var rec inodeRecord
+			if err := json.Unmarshal(line, &rec); err != nil {
+				return err
+			}
+			rec.Options = copyOptions(rec.Options)
+			meta.Inodes[rec.InodeID] = &rec
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	// dir_entries
+	si = manifest.Shards["dir_entries"]
+	meta.DirEntries = make(map[uint64]map[string]uint64, si.Count/10+1)
+	for _, file := range si.Files {
+		if err := readJSONLinesFile(fs, filepath.Join(chkpointDir, file), func(line []byte) error {
+			var e dirEntryLine
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			if meta.DirEntries[e.P] == nil {
+				meta.DirEntries[e.P] = map[string]uint64{}
+			}
+			meta.DirEntries[e.P][e.N] = e.C
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	// manifests
+	si = manifest.Shards["manifests"]
+	meta.Manifests = make(map[string]*manifestRecord, si.Count)
+	for _, file := range si.Files {
+		if err := readJSONLinesFile(fs, filepath.Join(chkpointDir, file), func(line []byte) error {
+			var rec manifestRecord
+			if err := json.Unmarshal(line, &rec); err != nil {
+				return err
+			}
+			rec.Chunks = append([]manifestChunk(nil), rec.Chunks...)
+			meta.Manifests[rec.ManifestID] = &rec
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	// chunks
+	si = manifest.Shards["chunks"]
+	meta.Chunks = make(map[string]*chunkRecord, si.Count)
+	for _, file := range si.Files {
+		if err := readJSONLinesFile(fs, filepath.Join(chkpointDir, file), func(line []byte) error {
+			var rec chunkRecord
+			if err := json.Unmarshal(line, &rec); err != nil {
+				return err
+			}
+			meta.Chunks[rec.ChunkID] = &rec
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	// segments
+	si = manifest.Shards["segments"]
+	meta.Segments = make(map[string]*segmentRecord, si.Count)
+	for _, file := range si.Files {
+		if err := readJSONLinesFile(fs, filepath.Join(chkpointDir, file), func(line []byte) error {
+			var rec segmentRecord
+			if err := json.Unmarshal(line, &rec); err != nil {
+				return err
+			}
+			meta.Segments[rec.SegmentID] = &rec
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	ensureMetaMaps(meta)
+	return nil
+}
+
+// --- shard I/O helpers ---------------------------------------------------------------
+
+func writeJSONFile(fs afero.Fs, path string, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomicSync(fs, path, data, 0o600)
+}
+
+func readJSONFileInto(fs afero.Fs, path string, fn func([]byte) error) error {
+	data, err := afero.ReadFile(fs, path)
+	if err != nil {
+		return err
+	}
+	return fn(data)
+}
+
+// saveMapAsJSONLines writes a map as one or more JSON Lines shard files.
+// numShards controls fanout; nameFn returns the file name for shard index.
+// records is a callback that yields each record as JSON bytes.
+func saveMapAsJSONLines(fs afero.Fs, baseDir string, numShards int, nameFn func(int) string, records func(yield func([]byte) bool)) (map[string]string, int, error) {
+	if numShards <= 0 {
+		numShards = 1
+	}
+	type shardBuf struct {
+		buf   bytes.Buffer
+		count int
+	}
+	shards := make([]shardBuf, numShards)
+	records(func(b []byte) bool {
+		idx := 0 // single shard
+		shards[idx].buf.Write(b)
+		shards[idx].buf.WriteByte('\n')
+		shards[idx].count++
+		return true
+	})
+	files := map[string]string{}
+	total := 0
+	for i := range numShards {
+		if shards[i].count == 0 {
+			continue
+		}
+		name := nameFn(i)
+		path := filepath.Join(baseDir, name)
+		if err := fs.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, 0, err
+		}
+		if err := afero.WriteFile(fs, path, shards[i].buf.Bytes(), 0o600); err != nil {
+			return nil, 0, err
+		}
+		files[strconv.Itoa(i)] = name
+		total += shards[i].count
+	}
+	return files, total, nil
+}
+
+func saveShardedMap[M ~map[K]V, K comparable, V any](
+	fs afero.Fs, baseDir, prefix string, records M, numShards int,
+	getShard func(K) int, encode func(K, V) ([]byte, error),
+) (map[string]string, int, error) {
+	if numShards <= 0 {
+		numShards = 1
+	}
+	type shardBuf struct {
+		buf   bytes.Buffer
+		count int
+	}
+	shards := make([]shardBuf, numShards)
+	for key, val := range records {
+		idx := getShard(key)
+		b, err := encode(key, val)
+		if err != nil {
+			return nil, 0, err
+		}
+		shards[idx].buf.Write(b)
+		shards[idx].buf.WriteByte('\n')
+		shards[idx].count++
+	}
+	dir := filepath.Join(baseDir, prefix)
+	if err := fs.MkdirAll(dir, 0o755); err != nil {
+		return nil, 0, err
+	}
+	files := map[string]string{}
+	total := 0
+	for i := range numShards {
+		if shards[i].count == 0 {
+			continue
+		}
+		name := fmt.Sprintf("%02x.jsonl", i)
+		path := filepath.Join(dir, name)
+		if err := afero.WriteFile(fs, path, shards[i].buf.Bytes(), 0o600); err != nil {
+			return nil, 0, err
+		}
+		files[strconv.Itoa(i)] = filepath.Join(prefix, name)
+		total += shards[i].count
+	}
+	return files, total, nil
+}
+
+func saveDirEntriesAsJSONLines(fs afero.Fs, baseDir string, entries map[uint64]map[string]uint64, numShards int) (map[string]string, int, error) {
+	if numShards <= 0 {
+		numShards = 1
+	}
+	type shardBuf struct {
+		buf   bytes.Buffer
+		count int
+	}
+	shards := make([]shardBuf, numShards)
+	for parentID, children := range entries {
+		for name, childID := range children {
+			idx := dirEntryShardIdx(parentID, name)
+			b, _ := json.Marshal(dirEntryLine{P: parentID, N: name, C: childID})
+			shards[idx].buf.Write(b)
+			shards[idx].buf.WriteByte('\n')
+			shards[idx].count++
+		}
+	}
+	dir := filepath.Join(baseDir, "dir_entries")
+	if err := fs.MkdirAll(dir, 0o755); err != nil {
+		return nil, 0, err
+	}
+	files := map[string]string{}
+	total := 0
+	for i := range numShards {
+		if shards[i].count == 0 {
+			continue
+		}
+		name := fmt.Sprintf("%02x.jsonl", i)
+		path := filepath.Join(dir, name)
+		if err := afero.WriteFile(fs, path, shards[i].buf.Bytes(), 0o600); err != nil {
+			return nil, 0, err
+		}
+		files[strconv.Itoa(i)] = filepath.Join("dir_entries", name)
+		total += shards[i].count
+	}
+	return files, total, nil
+}
+
+func readJSONLinesFile(fs afero.Fs, path string, fn func([]byte) error) error {
+	file, err := fs.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	dec := json.NewDecoder(file)
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if err := fn(raw); err != nil {
+			return err
 		}
 	}
 }
@@ -510,12 +974,34 @@ func recoverInProgressMetadata(meta *metadata) {
 	}
 }
 
-func saveMetaCheckpoint(fs afero.Fs, metaDir string, meta *metadata) error {
-	data, err := json.Marshal(meta)
+// migrateFunc converts metadata from version N to N+1.
+type migrateFunc func(fs afero.Fs, metaDir string) error
+
+// migrationChain maps from-version to the migration step that upgrades it.
+// Add new entries here when introducing a new format version.
+var migrationChain = map[int]migrateFunc{
+	1: migrateV1ToV2,
+}
+
+func migrateIfNeeded(fs afero.Fs, metaDir string) error {
+	super, err := loadMetaSuperBlock(fs, metaDir)
 	if err != nil {
 		return err
 	}
-	return writeFileAtomicSync(fs, filepath.Join(metaDir, metaCheckpointFile), data, 0o600)
+	from := super.FormatVersion
+	if from == 0 {
+		return nil
+	}
+	for v := from; v < metaFormatVersion; v++ {
+		fn, ok := migrationChain[v]
+		if !ok {
+			return fmt.Errorf("no migration from version %d", v)
+		}
+		if err := fn(fs, metaDir); err != nil {
+			return fmt.Errorf("migrate V%d→V%d: %w", v, v+1, err)
+		}
+	}
+	return nil
 }
 
 func loadMetaSuperBlock(fs afero.Fs, metaDir string) (metaSuperBlock, error) {
@@ -556,7 +1042,7 @@ func decodeMetaSuperBlock(data []byte) (metaSuperBlock, error) {
 	if err := json.Unmarshal(data, &super); err != nil {
 		return metaSuperBlock{}, err
 	}
-	if super.FormatVersion != metaFormatVersion {
+	if super.FormatVersion < 1 || super.FormatVersion > metaFormatVersion {
 		return metaSuperBlock{}, errors.New("unsupported metadata superblock version")
 	}
 	if super.LogFile == "" || filepath.Base(super.LogFile) != super.LogFile || !strings.HasSuffix(super.LogFile, ".log") {
@@ -654,6 +1140,12 @@ func compactMetadata(meta *metadata) {
 	}
 	for id, manifest := range meta.Manifests {
 		if manifest == nil || (manifest.State == manifestStateDeleted && manifest.RefCount <= 0 && !activeManifestRefs[id]) {
+			delete(meta.Manifests, id)
+			continue
+		}
+		// Clean up orphaned ACTIVE manifests (zero refcount, no inode pointing to them).
+		if manifest != nil && manifest.RefCount <= 0 && !activeManifestRefs[id] &&
+			manifest.State != manifestStateDegraded {
 			delete(meta.Manifests, id)
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/afero"
 )
@@ -20,14 +21,20 @@ func (s *Store) commitMetaLocked(ops []metaOp) error {
 	if err := writeMetaTx(s.metaLog, tx); err != nil {
 		return err
 	}
-	applyMetaTx(s.meta, tx)
+	for _, op := range tx.Ops {
+		applyMetaOp(s.meta, op)
+	}
+	if tx.TxID > s.meta.TxID {
+		s.meta.TxID = tx.TxID
+	}
 	s.commitsSinceCheckpoint++
 	if err := saveSuperBlock(s.fs, s.metaDir, s.meta.TxID, s.metaLogName); err != nil {
 		s.lastCheckpointErr = err
 		return err
 	}
 	s.lastCheckpointErr = nil
-	if s.commitsSinceCheckpoint >= metaCheckpointInterval {
+	if s.commitsSinceCheckpoint >= metaCheckpointInterval ||
+		(time.Since(s.lastCheckpointTime) >= metaCheckpointTimeMin && s.commitsSinceCheckpoint > 0) {
 		if err := s.checkpointMetaLocked(); err != nil {
 			return err
 		}
@@ -40,7 +47,7 @@ func (s *Store) checkpointMetaLocked() error {
 		return errMetadataLogClosed
 	}
 	compactMetadata(s.meta)
-	if err := saveMetaCheckpoint(s.fs, s.metaDir, s.meta); err != nil {
+	if err := saveCheckpoint(s.fs, s.metaDir, s.meta); err != nil {
 		s.lastCheckpointErr = err
 		return err
 	}
@@ -66,6 +73,7 @@ func (s *Store) checkpointMetaLocked() error {
 	s.metaLog = newLog
 	s.metaLogName = newName
 	s.commitsSinceCheckpoint = 0
+	s.lastCheckpointTime = time.Now()
 	s.lastCheckpointErr = nil
 	s.diagMu.Lock()
 	s.refCountWarnings = s.refCountWarnings[:0]
