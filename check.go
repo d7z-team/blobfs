@@ -30,6 +30,47 @@ type fileCheckSnapshot struct {
 	Chunks   []chunkCheckSnapshot
 }
 
+// ScrubOptions controls full-store corruption checks.
+type ScrubOptions struct {
+	CheckFiles bool
+}
+
+// CheckIssue describes one consistency or corruption problem found by CheckObject or Scrub.
+type CheckIssue struct {
+	Kind      string
+	ID        string
+	Path      string
+	Reason    string
+	TenantID  string
+	ChunkID   string
+	SegmentID string
+}
+
+// CheckResult reports object-level integrity verification.
+type CheckResult struct {
+	TenantID        string
+	Path            string
+	Healthy         bool
+	CheckedChunks   int
+	CheckedSegments int
+	CheckedBytes    int64
+	Issues          []CheckIssue
+}
+
+// ScrubResult reports full-store integrity verification.
+type ScrubResult struct {
+	Healthy         bool
+	CheckedChunks   int
+	CheckedSegments int
+	CheckedFiles    int
+	CheckedBytes    int64
+	MissingChunks   []string
+	MissingSegments []string
+	DegradedFiles   []string
+	AffectedFiles   []string
+	Issues          []CheckIssue
+}
+
 // CheckObject verifies one active object from metadata references through chunk and file hashes.
 func (s *Store) CheckObject(ctx context.Context, tenantID, path string) (*CheckResult, error) {
 	if err := s.beginOp(ctx); err != nil {

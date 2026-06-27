@@ -7,6 +7,38 @@ import (
 	"time"
 )
 
+type ImpactOptions struct {
+	TenantID     string
+	Prefix       string
+	ObjectPath   string
+	SegmentID    string
+	ChunkID      string
+	OnlyDegraded bool
+}
+
+type ImpactedObject struct {
+	TenantID        string
+	Path            string
+	State           string
+	Size            int64
+	Reason          string
+	ManifestID      string
+	MissingChunks   []string
+	MissingSegments []string
+}
+
+type ImpactReport struct {
+	AffectedTenants  []string
+	AffectedObjects  []ImpactedObject
+	AffectedChunks   []string
+	AffectedSegments []string
+	LogicalBytes     int64
+	StoredBytes      int64
+	ObjectCount      int
+	TenantCount      int
+	GeneratedAt      time.Time
+}
+
 func (s *Store) AssessImpact(ctx context.Context, opts ImpactOptions) (*ImpactReport, error) {
 	if err := s.beginOp(ctx); err != nil {
 		return nil, err
@@ -19,7 +51,7 @@ func (s *Store) AssessImpact(ctx context.Context, opts ImpactOptions) (*ImpactRe
 }
 
 func (s *Store) assessImpactLocked(opts ImpactOptions) *ImpactReport {
-	report := &ImpactReport{GeneratedAt: nowTime()}
+	report := &ImpactReport{GeneratedAt: time.Unix(0, nowUnix())}
 	tenantSet := map[string]bool{}
 	chunkSet := map[string]bool{}
 	segmentSet := map[string]bool{}
@@ -225,8 +257,4 @@ func containsString(items []string, want string) bool {
 		}
 	}
 	return false
-}
-
-func nowTime() time.Time {
-	return time.Unix(0, nowUnix())
 }

@@ -29,6 +29,25 @@ type segmentGCStats struct {
 	DeadAt        int64
 }
 
+// GCOptions overrides selected GC settings for a single run.
+type GCOptions struct {
+	SafetyWindow           time.Duration
+	CandidateConfirmCycles int
+	Compact                bool
+}
+
+// GCResult reports work completed by a GC run.
+type GCResult struct {
+	Epoch             int64
+	LiveChunks        int
+	CandidatesMarked  int
+	ChunksDeleted     int
+	SegmentsCompacted int
+	SegmentsDeleted   int
+	BytesRewritten    int64
+	BytesMadeGarbage  int64
+}
+
 // Lock ordering conventions:
 //   metaMu → leaseMu → pinMu
 //
@@ -450,7 +469,7 @@ func (s *Store) segmentSafeToDelete(segmentID string) bool {
 	s.metaMu.RLock()
 	seg := s.meta.Segments[segmentID]
 	s.metaMu.RUnlock()
-	if seg == nil || seg.State == segmentStateDeleted {
+	if seg == nil || seg.State == segmentStateDeleted || seg.State == segmentStateCompacting {
 		return false
 	}
 	if s.segmentPinned(segmentID) {

@@ -628,7 +628,7 @@ func (s *Store) createWriteSession() (afero.File, string, error) {
 		}
 	}()
 	for i := 0; i < 100; i++ {
-		name := filepath.Join(s.stagingDir, "sessions", "session-"+fmtTime()+"-"+strconv.Itoa(i)+".tmp")
+		name := filepath.Join(s.stagingDir, "sessions", "session-"+strconv.FormatInt(nowUnix(), 10)+"-"+strconv.Itoa(i)+".tmp")
 		if err := s.fs.MkdirAll(filepath.Dir(name), 0o700); err != nil {
 			return nil, "", err
 		}
@@ -642,10 +642,6 @@ func (s *Store) createWriteSession() (afero.File, string, error) {
 		return file, name, err
 	}
 	return nil, "", errors.New("create write session: exhausted name attempts")
-}
-
-func fmtTime() string {
-	return strconv.FormatInt(nowUnix(), 10)
 }
 
 func (s *Store) regularFileMode(mode os.FileMode) os.FileMode {

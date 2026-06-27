@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -718,6 +719,50 @@ func writeFileAtomicSync(fs afero.Fs, path string, data []byte, perm os.FileMode
 		return nil
 	}
 	return errors.New("create atomic metadata temp: exhausted attempts")
+}
+
+func inodeVisibleState(state string) bool {
+	return state == fileStateActive || state == fileStateDegraded
+}
+
+func manifestVisibleState(state string) bool {
+	return state == manifestStateActive || state == manifestStateDegraded
+}
+
+func chunkReadableState(state string) bool {
+	return state == chunkStateActive || state == chunkStateGarbageCandidate
+}
+
+func cloneInode(inode *inodeRecord) *inodeRecord {
+	next := *inode
+	next.Options = copyOptions(inode.Options)
+	return &next
+}
+
+func cloneManifest(manifest *manifestRecord) *manifestRecord {
+	next := *manifest
+	next.Chunks = append([]manifestChunk(nil), manifest.Chunks...)
+	return &next
+}
+
+func copyOptions(options map[string]string) map[string]string {
+	if options == nil {
+		return map[string]string{}
+	}
+	copied := make(map[string]string, len(options))
+	for k, v := range options {
+		copied[k] = v
+	}
+	return copied
+}
+
+func sortedNames(entries map[string]uint64) []string {
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func nowUnix() int64 {

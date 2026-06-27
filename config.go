@@ -62,100 +62,7 @@ type GCConfig struct {
 	CompactGarbageRatio    float64
 	BackgroundGCInterval   time.Duration
 	DefaultLeaseTTL        time.Duration
-	MinSafetyWindow        time.Duration
 	MaxConcurrentLeases    int
-}
-
-// GCOptions overrides selected GC settings for a single run.
-type GCOptions struct {
-	SafetyWindow           time.Duration
-	CandidateConfirmCycles int
-	Compact                bool
-}
-
-// GCResult reports work completed by a GC run.
-type GCResult struct {
-	Epoch             int64
-	LiveChunks        int
-	CandidatesMarked  int
-	ChunksDeleted     int
-	SegmentsCompacted int
-	SegmentsDeleted   int
-	BytesRewritten    int64
-	BytesMadeGarbage  int64
-}
-
-// ScrubOptions controls full-store corruption checks.
-type ScrubOptions struct {
-	CheckFiles bool
-}
-
-// CheckIssue describes one consistency or corruption problem found by CheckObject or Scrub.
-type CheckIssue struct {
-	Kind      string
-	ID        string
-	Path      string
-	Reason    string
-	TenantID  string
-	ChunkID   string
-	SegmentID string
-}
-
-// CheckResult reports object-level integrity verification.
-type CheckResult struct {
-	TenantID        string
-	Path            string
-	Healthy         bool
-	CheckedChunks   int
-	CheckedSegments int
-	CheckedBytes    int64
-	Issues          []CheckIssue
-}
-
-// ScrubResult reports full-store integrity verification.
-type ScrubResult struct {
-	Healthy         bool
-	CheckedChunks   int
-	CheckedSegments int
-	CheckedFiles    int
-	CheckedBytes    int64
-	MissingChunks   []string
-	MissingSegments []string
-	DegradedFiles   []string
-	AffectedFiles   []string
-	Issues          []CheckIssue
-}
-
-type ImpactOptions struct {
-	TenantID     string
-	Prefix       string
-	ObjectPath   string
-	SegmentID    string
-	ChunkID      string
-	OnlyDegraded bool
-}
-
-type ImpactedObject struct {
-	TenantID        string
-	Path            string
-	State           string
-	Size            int64
-	Reason          string
-	ManifestID      string
-	MissingChunks   []string
-	MissingSegments []string
-}
-
-type ImpactReport struct {
-	AffectedTenants  []string
-	AffectedObjects  []ImpactedObject
-	AffectedChunks   []string
-	AffectedSegments []string
-	LogicalBytes     int64
-	StoredBytes      int64
-	ObjectCount      int
-	TenantCount      int
-	GeneratedAt      time.Time
 }
 
 // DefaultConfig returns production-oriented defaults for CAS chunk storage.
@@ -182,7 +89,6 @@ func DefaultConfig() Config {
 			SegmentDeleteDelay:     24 * time.Hour,
 			CompactGarbageRatio:    0.6,
 			DefaultLeaseTTL:        24 * time.Hour,
-			MinSafetyWindow:        1 * time.Hour,
 			MaxConcurrentLeases:    10000,
 		},
 	}
