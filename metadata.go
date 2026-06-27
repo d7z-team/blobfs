@@ -52,6 +52,7 @@ const (
 	metaCheckpointShards   = 256
 	metaCheckpointDir      = "checkpoint"
 	metaCheckpointNextDir  = "checkpoint_next"
+	metaCleanShutdownFile  = "CLEAN_SHUTDOWN"
 	metaFrameMagic         = uint32(0x324d4642)
 	maxRecentGCRuns        = 1024
 	maxRefCountWarnings    = 1024

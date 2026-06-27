@@ -123,9 +123,14 @@ func OpenFS(fs afero.Fs, baseDir string, cfg Config) (*Store, error) {
 		return nil, err
 	}
 	store.recoveryWarnings = append([]metadataReplayWarning(nil), loadReport.ReplayWarnings...)
-	if err := store.cleanupStagingAndOrphans(); err != nil {
-		_ = store.Close()
-		return nil, err
+	if _, err := fs.Stat(filepath.Join(store.metaDir, metaCleanShutdownFile)); err == nil {
+		// Clean shutdown — skip staging/orphan scan.
+		_ = fs.Remove(filepath.Join(store.metaDir, metaCleanShutdownFile))
+	} else {
+		if err := store.cleanupStagingAndOrphans(); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
 	}
 	txlogDir := metaTxLogDir(store.metaDir)
 	if err := fs.MkdirAll(txlogDir, 0o755); err != nil {
@@ -271,6 +276,17 @@ func (s *Store) Close() error {
 			s.metaLog = nil
 		}
 		s.metaMu.Unlock()
+		// Attempt final clean-up before writing the shutdown marker.
+		// If clean-up succeeds the marker tells the next open to skip the recovery scan.
+		if closeErr == nil {
+			if cErr := s.cleanupStagingAndOrphans(); cErr != nil {
+				closeErr = errors.Join(closeErr, cErr)
+			} else {
+				if mErr := afero.WriteFile(s.fs, filepath.Join(s.metaDir, metaCleanShutdownFile), []byte("1"), 0o600); mErr != nil {
+					closeErr = errors.Join(closeErr, mErr)
+				}
+			}
+		}
 		if s.lockFile != nil {
 			closeErr = errors.Join(closeErr, s.lockFile.Close())
 			if err := s.fs.Remove(s.lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
