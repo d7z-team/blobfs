@@ -579,10 +579,7 @@ func saveCheckpoint(fs afero.Fs, metaDir string, meta *metadata) error {
 	// atomic swap: remove old, rename new
 	chkpointDir := filepath.Join(metaDir, metaCheckpointDir)
 	_ = fs.RemoveAll(chkpointDir)
-	if err := fs.Rename(nextDir, chkpointDir); err != nil {
-		return err
-	}
-	return nil
+	return fs.Rename(nextDir, chkpointDir)
 }
 
 func loadCheckpoint(fs afero.Fs, metaDir string, meta *metadata) error {
@@ -755,29 +752,23 @@ func readJSONFileInto(fs afero.Fs, path string, fn func([]byte) error) error {
 	return fn(data)
 }
 
-// saveMapAsJSONLines writes a map as one or more JSON Lines shard files.
-// numShards controls fanout; nameFn returns the file name for shard index.
-// records is a callback that yields each record as JSON bytes.
+// saveMapAsJSONLines writes a map as a single JSON Lines file (numShards is always 1 for tenants).
 func saveMapAsJSONLines(fs afero.Fs, baseDir string, numShards int, nameFn func(int) string, records func(yield func([]byte) bool)) (map[string]string, int, error) {
 	if numShards <= 0 {
 		numShards = 1
 	}
-	type shardBuf struct {
-		buf   bytes.Buffer
-		count int
-	}
-	shards := make([]shardBuf, numShards)
+	var buf bytes.Buffer
+	count := 0
 	records(func(b []byte) bool {
-		idx := 0 // single shard
-		shards[idx].buf.Write(b)
-		shards[idx].buf.WriteByte('\n')
-		shards[idx].count++
+		buf.Write(b)
+		buf.WriteByte('\n')
+		count++
 		return true
 	})
 	files := map[string]string{}
 	total := 0
 	for i := range numShards {
-		if shards[i].count == 0 {
+		if count == 0 {
 			continue
 		}
 		name := nameFn(i)
@@ -785,13 +776,81 @@ func saveMapAsJSONLines(fs afero.Fs, baseDir string, numShards int, nameFn func(
 		if err := fs.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return nil, 0, err
 		}
-		if err := afero.WriteFile(fs, path, shards[i].buf.Bytes(), 0o600); err != nil {
+		if err := afero.WriteFile(fs, path, buf.Bytes(), 0o600); err != nil {
 			return nil, 0, err
 		}
 		files[strconv.Itoa(i)] = name
-		total += shards[i].count
+		total += count
 	}
 	return files, total, nil
+}
+
+// shardFileWriter opens per-shard files lazily and writes JSON Lines records
+// directly to disk, avoiding in-memory accumulation for all shards.
+type shardFileWriter struct {
+	fs        afero.Fs
+	dir       string
+	openFiles []afero.File
+	counts    []int
+	buf       bytes.Buffer
+}
+
+func (w *shardFileWriter) write(shardIdx int, data []byte) error {
+	if w.openFiles[shardIdx] == nil {
+		name := fmt.Sprintf("%02x.jsonl", shardIdx)
+		f, err := w.fs.OpenFile(filepath.Join(w.dir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		w.openFiles[shardIdx] = f
+	}
+	w.buf.Reset()
+	w.buf.Write(data)
+	w.buf.WriteByte('\n')
+	if _, err := w.openFiles[shardIdx].Write(w.buf.Bytes()); err != nil {
+		return err
+	}
+	w.counts[shardIdx]++
+	return nil
+}
+
+func (w *shardFileWriter) finish(prefix string) (map[string]string, int, error) {
+	var closeErr error
+	files := map[string]string{}
+	total := 0
+	for i, f := range w.openFiles {
+		if f == nil {
+			continue
+		}
+		if err := f.Close(); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
+		w.openFiles[i] = nil
+		name := fmt.Sprintf("%02x.jsonl", i)
+		files[strconv.Itoa(i)] = filepath.Join(prefix, name)
+		total += w.counts[i]
+	}
+	if closeErr != nil {
+		return nil, 0, closeErr
+	}
+	return files, total, nil
+}
+
+func (w *shardFileWriter) cleanup() {
+	for _, f := range w.openFiles {
+		if f != nil {
+			_ = f.Close()
+		}
+	}
+}
+
+func newShardFileWriter(fs afero.Fs, dir string, numShards int) *shardFileWriter {
+	return &shardFileWriter{
+		fs:        fs,
+		dir:       dir,
+		openFiles: make([]afero.File, numShards),
+		counts:    make([]int, numShards),
+	}
 }
 
 func saveShardedMap[M ~map[K]V, K comparable, V any](
@@ -801,79 +860,44 @@ func saveShardedMap[M ~map[K]V, K comparable, V any](
 	if numShards <= 0 {
 		numShards = 1
 	}
-	type shardBuf struct {
-		buf   bytes.Buffer
-		count int
-	}
-	shards := make([]shardBuf, numShards)
-	for key, val := range records {
-		idx := getShard(key)
-		b, err := encode(key, val)
-		if err != nil {
-			return nil, 0, err
-		}
-		shards[idx].buf.Write(b)
-		shards[idx].buf.WriteByte('\n')
-		shards[idx].count++
-	}
 	dir := filepath.Join(baseDir, prefix)
 	if err := fs.MkdirAll(dir, 0o755); err != nil {
 		return nil, 0, err
 	}
-	files := map[string]string{}
-	total := 0
-	for i := range numShards {
-		if shards[i].count == 0 {
-			continue
-		}
-		name := fmt.Sprintf("%02x.jsonl", i)
-		path := filepath.Join(dir, name)
-		if err := afero.WriteFile(fs, path, shards[i].buf.Bytes(), 0o600); err != nil {
+	w := newShardFileWriter(fs, dir, numShards)
+	for key, val := range records {
+		b, err := encode(key, val)
+		if err != nil {
+			w.cleanup()
 			return nil, 0, err
 		}
-		files[strconv.Itoa(i)] = filepath.Join(prefix, name)
-		total += shards[i].count
+		if err := w.write(getShard(key), b); err != nil {
+			w.cleanup()
+			return nil, 0, err
+		}
 	}
-	return files, total, nil
+	return w.finish(prefix)
 }
 
 func saveDirEntriesAsJSONLines(fs afero.Fs, baseDir string, entries map[uint64]map[string]uint64, numShards int) (map[string]string, int, error) {
 	if numShards <= 0 {
 		numShards = 1
 	}
-	type shardBuf struct {
-		buf   bytes.Buffer
-		count int
-	}
-	shards := make([]shardBuf, numShards)
-	for parentID, children := range entries {
-		for name, childID := range children {
-			idx := dirEntryShardIdx(parentID, name)
-			b, _ := json.Marshal(dirEntryLine{P: parentID, N: name, C: childID})
-			shards[idx].buf.Write(b)
-			shards[idx].buf.WriteByte('\n')
-			shards[idx].count++
-		}
-	}
 	dir := filepath.Join(baseDir, "dir_entries")
 	if err := fs.MkdirAll(dir, 0o755); err != nil {
 		return nil, 0, err
 	}
-	files := map[string]string{}
-	total := 0
-	for i := range numShards {
-		if shards[i].count == 0 {
-			continue
+	w := newShardFileWriter(fs, dir, numShards)
+	for parentID, children := range entries {
+		for name, childID := range children {
+			b, _ := json.Marshal(dirEntryLine{P: parentID, N: name, C: childID})
+			if err := w.write(dirEntryShardIdx(parentID, name), b); err != nil {
+				w.cleanup()
+				return nil, 0, err
+			}
 		}
-		name := fmt.Sprintf("%02x.jsonl", i)
-		path := filepath.Join(dir, name)
-		if err := afero.WriteFile(fs, path, shards[i].buf.Bytes(), 0o600); err != nil {
-			return nil, 0, err
-		}
-		files[strconv.Itoa(i)] = filepath.Join("dir_entries", name)
-		total += shards[i].count
 	}
-	return files, total, nil
+	return w.finish("dir_entries")
 }
 
 func readJSONLinesFile(fs afero.Fs, path string, fn func([]byte) error) error {
